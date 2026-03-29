@@ -385,17 +385,52 @@ impl Filesystem for OneDriveFS {
 
     // setattr: accept time/mode/uid/gid changes silently — we do not persist
     // them to OneDrive, but returning ENOSYS breaks tools like `touch`.
-    // Size changes (truncation) are not supported on the FUSE layer.
     async fn setattr(
         &self,
         _req: Request,
         inode: u64,
-        _fh: Option<u64>,
+        fh: Option<u64>,
         set_attr: SetAttr,
     ) -> FuseResult<ReplyAttr> {
-        // Reject truncation — we don't support in-place writes via FUSE.
-        if set_attr.size.is_some() {
-            return Err(libc::EPERM.into());
+        // Handle truncation: editors (vim, nano, echo >) truncate before writing.
+        // Without this, old bytes linger when the new content is shorter.
+        if let Some(new_size) = set_attr.size {
+            let item_id = {
+                let map = self.inodes.read().await;
+                map.get(&inode).map(|e| e.item_id.clone())
+            };
+            let item_id = item_id.ok_or(libc::ENOENT)?;
+            let cache_path = self.cache_dir.join(&item_id);
+
+            // Truncate the cache file.
+            if cache_path.exists() {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&cache_path)
+                    .map_err(|e| {
+                        error!("truncate open {cache_path:?}: {e}");
+                        libc::EIO
+                    })?;
+                file.set_len(new_size).map_err(|e| {
+                    error!("truncate set_len {cache_path:?}: {e}");
+                    libc::EIO
+                })?;
+            }
+
+            // Mark the fh dirty so release() uploads the truncated file.
+            if let Some(fh) = fh {
+                self.dirty_fhs.write().await.insert(fh);
+            }
+
+            // Return updated attrs with new size.
+            if let Ok(Some(item)) = self.db.get_item_by_id(&item_id).await {
+                let mut attr = self.db_item_to_attr(&item, inode);
+                attr.size = new_size;
+                return Ok(ReplyAttr {
+                    ttl: std::time::Duration::from_secs(TTL_SEC),
+                    attr,
+                });
+            }
         }
 
         // For everything else (times, mode, uid, gid) just return current attrs.
@@ -414,6 +449,18 @@ impl Filesystem for OneDriveFS {
         if let Some(id) = item_id {
             if let Ok(Some(item)) = self.db.get_item_by_id(&id).await {
                 let attr = self.db_item_to_attr(&item, inode);
+                return Ok(ReplyAttr {
+                    ttl: std::time::Duration::from_secs(TTL_SEC),
+                    attr,
+                });
+            }
+        }
+
+        // Check symlink inodes.
+        {
+            let map = self.symlink_inodes.read().await;
+            if let Some(entry) = map.get(&inode) {
+                let attr = self.symlink_attr(inode, entry.target.len() as u64);
                 return Ok(ReplyAttr {
                     ttl: std::time::Duration::from_secs(TTL_SEC),
                     attr,
