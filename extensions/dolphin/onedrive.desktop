@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Service
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+MimeType=inode/directory;all/allfiles;
+Actions=OneDrivePin;OneDriveUnpin;
+X-KDE-Priority=TopLevel
+
+[Desktop Action OneDrivePin]
+Name=Keep on device
+Name[nb]=Behold på enheten
+Icon=folder-download
+Exec=/home/frank/.local/bin/odctl pin %F
+
+[Desktop Action OneDriveUnpin]
+Name=Free up space
+Name[nb]=Frigjør plass
+Icon=folder-cloud
+Exec=/home/frank/.local/bin/odctl unpin %F

@@ -1,0 +1,12 @@
+[package]
+name = "tray"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ksni = "0.2"
+sync-engine = { path = "../sync-engine" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tracing = "0.1"
+parking_lot = "0.12"

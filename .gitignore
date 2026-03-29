@@ -1,0 +1,27 @@
+/target
+*.swp
+*.swo
+.env
+tokens.json
+
+# CMake build artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+ecm_uninstall.cmake
+CTestTestfile.cmake
+Makefile
+*.so
+*.o
+*.moc
+
+# Qt autogen
+*_autogen/
+.qt/
+
+# Dolphin build outputs
+extensions/dolphin/build/
+extensions/dolphin/build-manual/
+extensions/dolphin/lib/
+extensions/dolphin/prefix.sh
+extensions/dolphin/prefix.sh.fish

@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "crates/graph-client",
+    "crates/sync-engine",
+    "crates/vfs",
+    "crates/daemon",
+    "crates/tray",
+    "crates/cli",
+]
+resolver = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = 3

@@ -1,0 +1,14 @@
+{
+    "KPlugin": {
+        "Id": "onedrive-overlay",
+        "Name": "OneDrive Sync State Overlay",
+        "Description": "Shows OneDrive sync state overlay icons in Dolphin",
+        "Version": "1.0",
+        "License": "MIT",
+        "Authors": [
+            {
+                "Name": "OneDrive for Linux"
+            }
+        ]
+    }
+}

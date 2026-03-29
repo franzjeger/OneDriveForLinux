@@ -1,0 +1,17 @@
+[package]
+name = "vfs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fuse3 = { version = "0.7", features = ["tokio-runtime", "unprivileged"] }
+sync-engine = { path = "../sync-engine" }
+graph-client = { path = "../graph-client" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+libc = "0.2"
+futures = "0.3"
+bytes = "1"
