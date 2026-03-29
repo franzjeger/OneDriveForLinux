@@ -701,7 +701,8 @@ impl Filesystem for OneDriveFS {
         let cache_path = self.cache_dir.join(&item_id);
 
         // On-demand download — only if the cache file is missing or stale.
-        if item.is_placeholder || !cache_path.exists() {
+        // Skip for _local_* temp items — they exist only in cache, not on OneDrive.
+        if !item_id.starts_with("_local_") && (item.is_placeholder || !cache_path.exists()) {
             debug!("open: on-demand download {item_id}");
             let graph = Arc::clone(&self.graph);
             let db = Arc::clone(&self.db);
@@ -828,8 +829,6 @@ impl Filesystem for OneDriveFS {
 
                     // Upload in background — release() must return immediately so
                     // the kernel doesn't block the calling process (e.g. Dolphin).
-                    let cache_dir = self.cache_dir.clone();
-                    let is_temp_item = id.starts_with("_local_");
                     tokio::spawn(async move {
                         if let Some(parent_id) = item.parent_id.clone() {
                             match graph.upload_file(&parent_id, &item.name, &cache_path).await {
@@ -839,17 +838,13 @@ impl Filesystem for OneDriveFS {
                                             .map(|m| m.len())
                                             .unwrap_or(0)
                                     });
-
-                                    if is_temp_item {
-                                        // Replace temp DB entry with real OneDrive item.
-                                        let _ = db.delete_item(&item.id).await;
-                                        // Rename cache file from temp ID to real ID.
-                                        let new_cache = cache_dir.join(&updated.id);
-                                        let _ = std::fs::rename(&cache_path, &new_cache);
-                                    }
-
-                                    let mut updated_item = item;
-                                    updated_item.id = updated.id;
+                                    // Re-read from DB to get current name/local_path — a
+                                    // concurrent rename() may have changed them while we
+                                    // were uploading. Without this, we'd overwrite the
+                                    // renamed entry with the stale pre-rename name.
+                                    let current = db.get_item_by_id(&item.id).await
+                                        .ok().flatten().unwrap_or(item);
+                                    let mut updated_item = current;
                                     updated_item.size = new_size;
                                     updated_item.etag = updated.e_tag;
                                     updated_item.ctag = updated.c_tag;
@@ -1033,37 +1028,50 @@ impl Filesystem for OneDriveFS {
         };
 
         if let Ok(Some(item)) = self.db.get_child_by_name(&old_parent_drive_id, &old_name).await {
+            let new_parent_path = self.inode_to_path(parent).await
+                .unwrap_or_else(|| self.sync_dir.clone());
+            let new_local_path = new_parent_path.join(new_name.as_ref());
+
+            // If destination already exists, remove it first (POSIX rename semantics).
+            if let Ok(Some(dest_item)) = self.db.get_child_by_name(&new_parent_drive_id, &new_name).await {
+                if !dest_item.id.starts_with("_local_") {
+                    let _ = self.graph.delete_item(&dest_item.id).await;
+                }
+                let _ = self.db.delete_item(&dest_item.id).await;
+                let _ = std::fs::remove_file(self.cache_dir.join(&dest_item.id));
+            }
+
             // Local-only temp items: rename locally without Graph API call.
             if item.id.starts_with("_local_") {
-                let new_parent_path = self.inode_to_path(parent).await
-                    .unwrap_or_else(|| self.sync_dir.clone());
-                let new_local_path = new_parent_path.join(new_name.as_ref());
                 let mut updated = item.clone();
                 updated.name = new_name.to_string();
                 updated.local_path = new_local_path;
                 updated.parent_id = Some(new_parent_drive_id);
-                // Delete old entry and insert updated one.
                 let _ = self.db.delete_item(&item.id).await;
                 if let Err(e) = self.db.upsert_item(&updated).await {
                     warn!("Failed to upsert renamed temp item: {e}");
                 }
-                // Rename cache file.
-                let old_cache = self.cache_dir.join(&item.id);
-                let new_cache = self.cache_dir.join(&item.id);
-                if old_cache.exists() && old_cache != new_cache {
-                    let _ = std::fs::rename(&old_cache, &new_cache);
-                }
                 return Ok(());
             }
 
+            // Synced items: move on Graph API and update DB entry in place.
             match self
                 .graph
                 .move_item(&item.id, &new_parent_drive_id, &new_name)
                 .await
             {
-                Ok(_) => {
-                    if let Err(e) = self.db.delete_item(&item.id).await {
-                        warn!("Failed to delete DB item after rename: {e}");
+                Ok(moved) => {
+                    // Update DB entry with new name/path — do NOT delete it,
+                    // otherwise the file vanishes from FUSE until next delta sync.
+                    let mut updated = item.clone();
+                    updated.name = new_name.to_string();
+                    updated.local_path = new_local_path;
+                    updated.parent_id = Some(new_parent_drive_id);
+                    updated.etag = moved.e_tag;
+                    updated.ctag = moved.c_tag;
+                    // Delete then re-insert (local_path changed, ON CONFLICT(id) handles it).
+                    if let Err(e) = self.db.upsert_item(&updated).await {
+                        warn!("Failed to update DB after rename: {e}");
                     }
                     return Ok(());
                 }
