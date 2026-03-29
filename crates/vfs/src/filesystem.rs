@@ -2,8 +2,8 @@ use fuse3::{
     raw::{
         reply::{
             DirectoryEntry, DirectoryEntryPlus, FileAttr, ReplyAttr, ReplyCreated, ReplyData,
-            ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyOpen, ReplyWrite,
-            ReplyXAttr,
+            ReplyDirectory, ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyOpen, ReplyStatFs,
+            ReplyWrite, ReplyXAttr,
         },
         Filesystem, Request,
     },
@@ -51,6 +51,15 @@ struct InodeEntry {
     is_dir: bool,
 }
 
+/// In-memory symlink inode entry (local-only, not synced to OneDrive).
+#[derive(Clone)]
+struct SymlinkEntry {
+    inode: u64,
+    parent_inode: u64,
+    name: String,
+    target: String,
+}
+
 pub struct OneDriveFS {
     db: Arc<Database>,
     graph: Arc<GraphClient>,
@@ -70,6 +79,10 @@ pub struct OneDriveFS {
     /// OneDrive drive item ID of the root folder (parent_id of all top-level items).
     /// Stored in an RwLock so it can be refreshed after the initial delta sync populates the DB.
     root_drive_id: RwLock<String>,
+    /// inode → SymlinkEntry for local-only symlinks
+    symlink_inodes: RwLock<BTreeMap<u64, SymlinkEntry>>,
+    /// (parent_inode, name) → symlink inode for fast lookup
+    symlink_lookup: RwLock<BTreeMap<(u64, String), u64>>,
 }
 
 impl OneDriveFS {
@@ -98,6 +111,8 @@ impl OneDriveFS {
             sync_dir,
             cache_dir,
             root_drive_id: RwLock::new(root_drive_id),
+            symlink_inodes: RwLock::new(BTreeMap::new()),
+            symlink_lookup: RwLock::new(BTreeMap::new()),
         })
     }
 
@@ -193,6 +208,36 @@ impl OneDriveFS {
         }
     }
 
+    fn symlink_attr(&self, ino: u64, target_len: u64) -> FileAttr {
+        let now = sys_time_to_ts(SystemTime::now());
+        FileAttr {
+            ino,
+            size: target_len,
+            blocks: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            kind: FileType::Symlink,
+            perm: 0o777,
+            nlink: 1,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            rdev: 0,
+            blksize: 4096,
+        }
+    }
+
+    /// Resolve a parent inode to a local filesystem path (for symlink DB storage).
+    async fn inode_to_path(&self, inode: u64) -> Option<std::path::PathBuf> {
+        if inode == 1 {
+            return Some(self.sync_dir.clone());
+        }
+        let map = self.inodes.read().await;
+        let entry = map.get(&inode)?;
+        let item = self.db.get_item_by_id(&entry.item_id).await.ok()??;
+        Some(item.local_path)
+    }
+
     fn root_attr(&self) -> FileAttr {
         let now = sys_time_to_ts(SystemTime::now());
         FileAttr {
@@ -250,6 +295,46 @@ impl Filesystem for OneDriveFS {
             });
         }
 
+        // Check local-only symlinks.
+        {
+            let lookup = self.symlink_lookup.read().await;
+            if let Some(&ino) = lookup.get(&(parent, name_str.to_string())) {
+                let map = self.symlink_inodes.read().await;
+                if let Some(entry) = map.get(&ino) {
+                    let attr = self.symlink_attr(ino, entry.target.len() as u64);
+                    return Ok(ReplyEntry {
+                        ttl: std::time::Duration::from_secs(TTL_SEC),
+                        attr,
+                        generation: 0,
+                    });
+                }
+            }
+        }
+
+        // Check DB for persisted symlinks not yet in memory (after daemon restart).
+        if let Some(parent_path) = self.inode_to_path(parent).await {
+            if let Ok(Some(target)) = self.db.get_symlink(&parent_path, &name_str).await {
+                let ino = next_inode();
+                let entry = SymlinkEntry {
+                    inode: ino,
+                    parent_inode: parent,
+                    name: name_str.to_string(),
+                    target: target.clone(),
+                };
+                self.symlink_inodes.write().await.insert(ino, entry);
+                self.symlink_lookup
+                    .write()
+                    .await
+                    .insert((parent, name_str.to_string()), ino);
+                let attr = self.symlink_attr(ino, target.len() as u64);
+                return Ok(ReplyEntry {
+                    ttl: std::time::Duration::from_secs(TTL_SEC),
+                    attr,
+                    generation: 0,
+                });
+            }
+        }
+
         Err(libc::ENOENT.into())
     }
 
@@ -276,6 +361,18 @@ impl Filesystem for OneDriveFS {
         if let Some(id) = item_id {
             if let Ok(Some(item)) = self.db.get_item_by_id(&id).await {
                 let attr = self.db_item_to_attr(&item, inode);
+                return Ok(ReplyAttr {
+                    ttl: std::time::Duration::from_secs(TTL_SEC),
+                    attr,
+                });
+            }
+        }
+
+        // Check symlink inodes.
+        {
+            let map = self.symlink_inodes.read().await;
+            if let Some(entry) = map.get(&inode) {
+                let attr = self.symlink_attr(inode, entry.target.len() as u64);
                 return Ok(ReplyAttr {
                     ttl: std::time::Duration::from_secs(TTL_SEC),
                     attr,
@@ -380,6 +477,40 @@ impl Filesystem for OneDriveFS {
             entry_offset += 1;
         }
 
+        // Include local-only symlinks.
+        if let Some(parent_path) = self.inode_to_path(inode).await {
+            if let Ok(symlinks) = self.db.get_symlinks_in(&parent_path).await {
+                for (name, target) in symlinks {
+                    let lookup = self.symlink_lookup.read().await;
+                    let ino = if let Some(&existing) = lookup.get(&(inode, name.clone())) {
+                        existing
+                    } else {
+                        drop(lookup);
+                        let new_ino = next_inode();
+                        let entry = SymlinkEntry {
+                            inode: new_ino,
+                            parent_inode: inode,
+                            name: name.clone(),
+                            target,
+                        };
+                        self.symlink_inodes.write().await.insert(new_ino, entry);
+                        self.symlink_lookup
+                            .write()
+                            .await
+                            .insert((inode, name.clone()), new_ino);
+                        new_ino
+                    };
+                    entries.push(Ok(DirectoryEntry {
+                        inode: ino,
+                        offset: entry_offset,
+                        kind: FileType::Symlink,
+                        name: std::ffi::OsString::from(&name),
+                    }));
+                    entry_offset += 1;
+                }
+            }
+        }
+
         let skip = if offset == 0 { 0 } else { offset as usize };
         let result: Vec<_> = entries.into_iter().skip(skip).collect();
 
@@ -454,6 +585,45 @@ impl Filesystem for OneDriveFS {
                 attr_ttl: ttl,
             }));
             entry_offset += 1;
+        }
+
+        // Include local-only symlinks.
+        if let Some(parent_path) = self.inode_to_path(inode).await {
+            if let Ok(symlinks) = self.db.get_symlinks_in(&parent_path).await {
+                for (name, target) in symlinks {
+                    let lookup = self.symlink_lookup.read().await;
+                    let ino = if let Some(&existing) = lookup.get(&(inode, name.clone())) {
+                        existing
+                    } else {
+                        drop(lookup);
+                        let new_ino = next_inode();
+                        let entry = SymlinkEntry {
+                            inode: new_ino,
+                            parent_inode: inode,
+                            name: name.clone(),
+                            target: target.clone(),
+                        };
+                        self.symlink_inodes.write().await.insert(new_ino, entry);
+                        self.symlink_lookup
+                            .write()
+                            .await
+                            .insert((inode, name.clone()), new_ino);
+                        new_ino
+                    };
+                    let sym_attr = self.symlink_attr(ino, target.len() as u64);
+                    entries.push(Ok(DirectoryEntryPlus {
+                        inode: ino,
+                        generation: 0,
+                        offset: entry_offset,
+                        kind: FileType::Symlink,
+                        name: std::ffi::OsString::from(&name),
+                        attr: sym_attr,
+                        entry_ttl: ttl,
+                        attr_ttl: ttl,
+                    }));
+                    entry_offset += 1;
+                }
+            }
         }
 
         let skip = if offset == 0 { 0 } else { offset as usize };
@@ -754,6 +924,24 @@ impl Filesystem for OneDriveFS {
             let _ = std::fs::remove_file(&cache_path);
             return Ok(());
         }
+
+        // Check if it's a local-only symlink.
+        {
+            let lookup = self.symlink_lookup.read().await;
+            if let Some(&ino) = lookup.get(&(parent, name_str.to_string())) {
+                drop(lookup);
+                self.symlink_inodes.write().await.remove(&ino);
+                self.symlink_lookup
+                    .write()
+                    .await
+                    .remove(&(parent, name_str.to_string()));
+                if let Some(parent_path) = self.inode_to_path(parent).await {
+                    let _ = self.db.delete_symlink(&parent_path, &name_str).await;
+                }
+                return Ok(());
+            }
+        }
+
         Err(libc::ENOENT.into())
     }
 
@@ -970,6 +1158,73 @@ impl Filesystem for OneDriveFS {
             generation: 0,
             fh,
             flags: 0,
+        })
+    }
+
+    async fn statfs(&self, _req: Request, _inode: u64) -> FuseResult<ReplyStatFs> {
+        // Return reasonable defaults. Real quota info would require a Graph API
+        // call which is too expensive for every statfs invocation.
+        Ok(ReplyStatFs {
+            blocks: 1_000_000_000 / 4, // ~1 TB in 4K blocks
+            bfree: 500_000_000 / 4,    // ~500 GB free
+            bavail: 500_000_000 / 4,
+            files: 1_000_000,
+            ffree: 500_000,
+            bsize: 4096,
+            namelen: 255,
+            frsize: 4096,
+        })
+    }
+
+    async fn symlink(
+        &self,
+        _req: Request,
+        parent: u64,
+        name: &OsStr,
+        link: &OsStr,
+    ) -> FuseResult<ReplyEntry> {
+        let name_str = name.to_string_lossy().to_string();
+        let target = link.to_string_lossy().to_string();
+        debug!("symlink parent={parent} name={name_str} -> {target}");
+
+        // Store in DB for persistence across daemon restarts.
+        let parent_path = self.inode_to_path(parent).await.ok_or(libc::ENOENT)?;
+        self.db
+            .create_symlink(&parent_path, &name_str, &target)
+            .await
+            .map_err(|e| {
+                error!("create_symlink DB error: {e}");
+                libc::EIO
+            })?;
+
+        // Create inode for the symlink.
+        let ino = next_inode();
+        let entry = SymlinkEntry {
+            inode: ino,
+            parent_inode: parent,
+            name: name_str.clone(),
+            target: target.clone(),
+        };
+        self.symlink_inodes.write().await.insert(ino, entry);
+        self.symlink_lookup
+            .write()
+            .await
+            .insert((parent, name_str), ino);
+
+        let attr = self.symlink_attr(ino, target.len() as u64);
+        Ok(ReplyEntry {
+            ttl: std::time::Duration::from_secs(TTL_SEC),
+            attr,
+            generation: 0,
+        })
+    }
+
+    async fn readlink(&self, _req: Request, inode: u64) -> FuseResult<ReplyData> {
+        debug!("readlink inode={inode}");
+        let map = self.symlink_inodes.read().await;
+        let entry = map.get(&inode).ok_or(libc::ENOENT)?;
+        Ok(ReplyData {
+            data: bytes::Bytes::from(entry.target.clone().into_bytes()),
         })
     }
 }

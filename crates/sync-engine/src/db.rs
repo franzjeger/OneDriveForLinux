@@ -91,6 +91,13 @@ impl Database {
 
              CREATE TABLE IF NOT EXISTS sync_excluded (
                  pattern TEXT PRIMARY KEY
+             );
+
+             CREATE TABLE IF NOT EXISTS local_symlinks (
+                 parent_path TEXT NOT NULL,
+                 name        TEXT NOT NULL,
+                 target      TEXT NOT NULL,
+                 PRIMARY KEY (parent_path, name)
              );",
         )
         .context("database migration")?;
@@ -555,6 +562,70 @@ impl Database {
                 }
             }
             Ok(SyncState::CloudOnly)
+        })
+        .await
+    }
+
+    // ── Local symlinks (FUSE-only, never synced to OneDrive) ─────────────────
+
+    /// Create a local-only symlink entry.
+    pub async fn create_symlink(&self, parent_path: &Path, name: &str, target: &str) -> Result<()> {
+        let parent_str = parent_path.to_string_lossy().to_string();
+        let name = name.to_string();
+        let target = target.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO local_symlinks (parent_path, name, target) VALUES (?1, ?2, ?3)",
+                params![parent_str, name, target],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Read a symlink target.
+    pub async fn get_symlink(&self, parent_path: &Path, name: &str) -> Result<Option<String>> {
+        let parent_str = parent_path.to_string_lossy().to_string();
+        let name = name.to_string();
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT target FROM local_symlinks WHERE parent_path = ?1 AND name = ?2",
+            )?;
+            let mut rows = stmt.query(params![parent_str, name])?;
+            if let Some(row) = rows.next()? {
+                Ok(Some(row.get(0)?))
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+    }
+
+    /// List all symlinks under a parent path.
+    pub async fn get_symlinks_in(&self, parent_path: &Path) -> Result<Vec<(String, String)>> {
+        let parent_str = parent_path.to_string_lossy().to_string();
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT name, target FROM local_symlinks WHERE parent_path = ?1",
+            )?;
+            let rows = stmt.query_map(params![parent_str], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        })
+        .await
+    }
+
+    /// Delete a symlink.
+    pub async fn delete_symlink(&self, parent_path: &Path, name: &str) -> Result<()> {
+        let parent_str = parent_path.to_string_lossy().to_string();
+        let name = name.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "DELETE FROM local_symlinks WHERE parent_path = ?1 AND name = ?2",
+                params![parent_str, name],
+            )?;
+            Ok(())
         })
         .await
     }
