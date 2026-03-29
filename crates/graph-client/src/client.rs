@@ -17,6 +17,10 @@ const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
 const LARGE_FILE_THRESHOLD: u64 = 4 * 1024 * 1024; // 4 MB
 /// Chunk size for upload sessions (must be multiple of 320 KiB per Graph API).
 const UPLOAD_CHUNK_SIZE: usize = 10 * 320 * 1024; // ~3.2 MB
+/// Maximum number of retries for transient failures.
+const MAX_RETRIES: u32 = 3;
+/// Base delay for exponential backoff (doubles each retry).
+const RETRY_BASE_DELAY_SECS: u64 = 2;
 
 pub struct GraphClient {
     http: reqwest::Client,
@@ -44,42 +48,83 @@ impl GraphClient {
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> GraphResult<T> {
-        let token = self.bearer().await?;
-        let resp = self
-            .http
-            .get(url)
-            .bearer_auth(&token)
-            .send()
-            .await?;
-
-        self.check_status(&resp).await?;
+        let resp = self.request_with_retry(|| async {
+            let token = self.bearer().await?;
+            let resp = self
+                .http
+                .get(url)
+                .bearer_auth(&token)
+                .send()
+                .await?;
+            Ok(resp)
+        }).await?;
         let val: T = resp.json().await?;
         Ok(val)
     }
 
-    async fn check_status(&self, resp: &reqwest::Response) -> GraphResult<()> {
-        let status = resp.status();
-        if status.is_success() {
-            return Ok(());
+    /// Execute a request closure with automatic retry on transient errors.
+    /// Retries on: 429 (rate limit), 500, 502, 503, 504 (server errors),
+    /// and network/timeout errors. Uses exponential backoff, respecting
+    /// Retry-After headers from 429 responses.
+    async fn request_with_retry<F, Fut>(&self, make_request: F) -> GraphResult<reqwest::Response>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = GraphResult<reqwest::Response>>,
+    {
+        let mut attempt = 0u32;
+        loop {
+            let result = make_request().await;
+            attempt += 1;
+
+            match result {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    match status {
+                        200..=299 => return Ok(resp),
+                        429 => {
+                            let retry_secs = resp
+                                .headers()
+                                .get("Retry-After")
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .unwrap_or(30);
+                            if attempt > MAX_RETRIES {
+                                return Err(GraphError::RateLimited { retry_after_secs: retry_secs });
+                            }
+                            warn!("Rate limited (429), retry {attempt}/{MAX_RETRIES} after {retry_secs}s");
+                            tokio::time::sleep(std::time::Duration::from_secs(retry_secs)).await;
+                        }
+                        404 => return Err(GraphError::NotFound(status.to_string())),
+                        500 | 502 | 503 | 504 => {
+                            if attempt > MAX_RETRIES {
+                                return Err(GraphError::Api {
+                                    status,
+                                    message: resp.status().canonical_reason().unwrap_or("server error").into(),
+                                });
+                            }
+                            let delay = RETRY_BASE_DELAY_SECS * 2u64.pow(attempt - 1);
+                            warn!("Server error ({status}), retry {attempt}/{MAX_RETRIES} after {delay}s");
+                            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                        }
+                        _ => {
+                            return Err(GraphError::Api {
+                                status,
+                                message: resp.status().canonical_reason().unwrap_or("unknown").into(),
+                            });
+                        }
+                    }
+                }
+                Err(GraphError::Http(e)) if e.is_timeout() || e.is_connect() => {
+                    if attempt > MAX_RETRIES {
+                        return Err(GraphError::Http(e));
+                    }
+                    let delay = RETRY_BASE_DELAY_SECS * 2u64.pow(attempt - 1);
+                    warn!("Network error ({e}), retry {attempt}/{MAX_RETRIES} after {delay}s");
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                }
+                Err(e) => return Err(e),
+            }
         }
-        if status.as_u16() == 429 {
-            let retry = resp
-                .headers()
-                .get("Retry-After")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(30);
-            return Err(GraphError::RateLimited {
-                retry_after_secs: retry,
-            });
-        }
-        if status.as_u16() == 404 {
-            return Err(GraphError::NotFound(status.to_string()));
-        }
-        Err(GraphError::Api {
-            status: status.as_u16(),
-            message: status.canonical_reason().unwrap_or("unknown").into(),
-        })
     }
 
     // ── Drive root ─────────────────────────────────────────────────────────────
@@ -134,17 +179,19 @@ impl GraphClient {
         // Collect all pages into one response so callers get a complete batch.
         let mut all_items = Vec::new();
         let mut current_url = url;
-        let mut final_delta_link = None;
+        let mut final_delta_link: Option<String> = None;
 
         loop {
-            let token = self.bearer().await?;
-            let resp = self
-                .http
-                .get(&current_url)
-                .bearer_auth(&token)
-                .send()
-                .await?;
-            self.check_status(&resp).await?;
+            let resp = self.request_with_retry(|| async {
+                let token = self.bearer().await?;
+                let resp = self
+                    .http
+                    .get(&current_url)
+                    .bearer_auth(&token)
+                    .send()
+                    .await?;
+                Ok(resp)
+            }).await?;
 
             // Parse via serde_json::Value first so that individual items with
             // unexpected field types don't abort the whole page.
@@ -180,7 +227,7 @@ impl GraphClient {
         let url = format!("{GRAPH_BASE}/me/drive/items/{item_id}/content");
         debug!("download_file({item_id}) -> {dest:?}");
 
-        let resp = loop {
+        let resp = self.request_with_retry(|| async {
             let token = self.bearer().await?;
             let resp = self
                 .http
@@ -188,20 +235,8 @@ impl GraphClient {
                 .bearer_auth(&token)
                 .send()
                 .await?;
-            if resp.status().as_u16() == 429 {
-                let retry = resp
-                    .headers()
-                    .get("Retry-After")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(30);
-                warn!("Rate limited downloading {item_id}, sleeping {retry}s");
-                tokio::time::sleep(std::time::Duration::from_secs(retry)).await;
-                continue;
-            }
-            self.check_status(&resp).await?;
-            break resp;
-        };
+            Ok(resp)
+        }).await?;
 
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -248,19 +283,25 @@ impl GraphClient {
         debug!("upload_small -> {url}");
 
         let data = tokio::fs::read(path).await?;
-        let token = self.bearer().await?;
         let content_length = data.len();
 
-        let resp = self
-            .http
-            .put(&url)
-            .bearer_auth(&token)
-            .header("Content-Type", "application/octet-stream")
-            .header("Content-Length", content_length.to_string())
-            .body(data)
-            .send()
-            .await?;
-        self.check_status(&resp).await?;
+        let resp = self.request_with_retry(|| {
+            let data = data.clone();
+            let url = url.clone();
+            async move {
+                let token = self.bearer().await?;
+                let resp = self
+                    .http
+                    .put(&url)
+                    .bearer_auth(&token)
+                    .header("Content-Type", "application/octet-stream")
+                    .header("Content-Length", content_length.to_string())
+                    .body(data)
+                    .send()
+                    .await?;
+                Ok(resp)
+            }
+        }).await?;
         let item: DriveItem = resp.json().await?;
         info!("Uploaded (small) {name} -> id={}", item.id);
         Ok(item)
@@ -282,15 +323,17 @@ impl GraphClient {
             },
         };
 
-        let token = self.bearer().await?;
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await?;
-        self.check_status(&resp).await?;
+        let resp = self.request_with_retry(|| async {
+            let token = self.bearer().await?;
+            let resp = self
+                .http
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await?;
+            Ok(resp)
+        }).await?;
         let session: UploadSession = resp.json().await?;
         debug!("Upload session created: {}", session.upload_url);
         Ok(session)
@@ -371,15 +414,17 @@ impl GraphClient {
             conflict_behavior: "rename".into(),
         };
 
-        let token = self.bearer().await?;
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await?;
-        self.check_status(&resp).await?;
+        let resp = self.request_with_retry(|| async {
+            let token = self.bearer().await?;
+            let resp = self
+                .http
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await?;
+            Ok(resp)
+        }).await?;
         let item: DriveItem = resp.json().await?;
         info!("Created folder '{name}' id={}", item.id);
         Ok(item)
@@ -387,19 +432,26 @@ impl GraphClient {
 
     pub async fn delete_item(&self, item_id: &str) -> GraphResult<()> {
         let url = format!("{GRAPH_BASE}/me/drive/items/{item_id}");
-        let token = self.bearer().await?;
-        let resp = self
-            .http
-            .delete(&url)
-            .bearer_auth(&token)
-            .send()
-            .await?;
+        let resp = self.request_with_retry(|| async {
+            let token = self.bearer().await?;
+            let resp = self
+                .http
+                .delete(&url)
+                .bearer_auth(&token)
+                .send()
+                .await?;
+            Ok(resp)
+        }).await?;
         // 204 = success for delete
         if resp.status().as_u16() == 204 || resp.status().is_success() {
             info!("Deleted item {item_id}");
             return Ok(());
         }
-        self.check_status(&resp).await
+        // request_with_retry already checked for errors, but handle edge cases
+        Err(GraphError::Api {
+            status: resp.status().as_u16(),
+            message: resp.status().canonical_reason().unwrap_or("unknown").into(),
+        })
     }
 
     pub async fn move_item(
@@ -416,15 +468,17 @@ impl GraphClient {
             name: new_name.to_string(),
         };
 
-        let token = self.bearer().await?;
-        let resp = self
-            .http
-            .patch(&url)
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await?;
-        self.check_status(&resp).await?;
+        let resp = self.request_with_retry(|| async {
+            let token = self.bearer().await?;
+            let resp = self
+                .http
+                .patch(&url)
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await?;
+            Ok(resp)
+        }).await?;
         let item: DriveItem = resp.json().await?;
         info!("Moved item {item_id} -> parent={new_parent_id} name={new_name}");
         Ok(item)

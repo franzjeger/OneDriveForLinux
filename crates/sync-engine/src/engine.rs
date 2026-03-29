@@ -5,9 +5,10 @@ use crate::{
     watcher::{EventDebouncer, LocalWatcher},
 };
 use chrono::Utc;
+use dashmap::DashMap;
 use graph_client::{DriveItem, GraphClient};
 use std::{path::Path, path::PathBuf, sync::{Arc, atomic::{AtomicUsize, Ordering}}, time::Instant};
-use tokio::sync::{broadcast, RwLock, Semaphore};
+use tokio::sync::{broadcast, Mutex as TokioMutex, RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 
 pub struct SyncEngine {
@@ -18,6 +19,9 @@ pub struct SyncEngine {
     paused: Arc<RwLock<bool>>,
     /// Cache directory for on-demand file storage (outside the FUSE mountpoint).
     cache_dir: Option<std::path::PathBuf>,
+    /// Per-item locks to prevent concurrent downloads/uploads of the same file.
+    /// Key: OneDrive item ID. The lock is held for the duration of the operation.
+    item_locks: Arc<DashMap<String, Arc<TokioMutex<()>>>>,
 }
 
 impl SyncEngine {
@@ -35,6 +39,7 @@ impl SyncEngine {
             event_tx,
             paused: Arc::new(RwLock::new(false)),
             cache_dir,
+            item_locks: Arc::new(DashMap::new()),
         };
         (engine, event_rx)
     }
@@ -444,7 +449,11 @@ impl SyncEngine {
     }
 
     /// Download a remote item to local disk and update the database.
+    /// Holds a per-item lock to prevent concurrent downloads of the same file.
     pub async fn download_item(&self, item: &DriveItem, local_path: &Path) -> anyhow::Result<()> {
+        let lock = self.item_lock(&item.id);
+        let _guard = lock.lock().await;
+
         if let Err(e) = self.db.set_sync_state(&item.id, &SyncState::Syncing).await {
             warn!("Failed to set Syncing state for {}: {e}", item.id);
         }
@@ -471,7 +480,17 @@ impl SyncEngine {
     }
 
     /// Upload a local path to OneDrive.
+    /// Holds a per-item lock (if item exists in DB) to prevent concurrent operations.
     pub async fn upload_item(&self, path: &Path) -> anyhow::Result<()> {
+        // Acquire per-item lock if this file is already tracked.
+        let existing_id = self.db.get_item_by_path(path).await.ok().flatten().map(|i| i.id);
+        let _guard = if let Some(ref id) = existing_id {
+            let lock = self.item_lock(id);
+            Some(lock.lock_owned().await)
+        } else {
+            None
+        };
+
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -726,9 +745,11 @@ impl SyncEngine {
             let id = db_item.id.clone();
             let remaining = Arc::clone(&remaining);
             let sem = Arc::clone(&sem);
+            let lock = self.item_lock(&id);
 
             tokio::spawn(async move {
                 let _permit = sem.acquire().await;
+                let _guard = lock.lock().await;
                 let cache_path = cache_dir.join(&id);
                 if !cache_path.exists() {
                     match graph.download_file(&id, &cache_path).await {
@@ -829,6 +850,15 @@ impl SyncEngine {
             .into_iter()
             .map(|i| (i.local_path, i.sync_state))
             .collect()
+    }
+
+    /// Get or create a per-item lock. Prevents concurrent downloads/uploads
+    /// of the same file, eliminating TOCTOU races on cache files.
+    fn item_lock(&self, item_id: &str) -> Arc<TokioMutex<()>> {
+        self.item_locks
+            .entry(item_id.to_string())
+            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+            .clone()
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────
