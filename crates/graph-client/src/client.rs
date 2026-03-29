@@ -242,16 +242,40 @@ impl GraphClient {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let mut file = tokio::fs::File::create(dest).await?;
-        let mut stream = resp.bytes_stream();
+        // Atomic download: write to a temp file first, then rename.
+        // If the daemon crashes mid-download, only the .tmp file is left
+        // (and will be cleaned up on next run), not a corrupt target file.
+        let tmp_path = dest.with_extension(format!(
+            "{}.tmp",
+            dest.extension().and_then(|e| e.to_str()).unwrap_or("")
+        ));
 
-        while let Some(chunk) = stream.next().await {
-            let chunk: Bytes = chunk?;
-            file.write_all(&chunk).await?;
+        let result = async {
+            let mut file = tokio::fs::File::create(&tmp_path).await?;
+            let mut stream = resp.bytes_stream();
+
+            while let Some(chunk) = stream.next().await {
+                let chunk: Bytes = chunk?;
+                file.write_all(&chunk).await?;
+            }
+            file.flush().await?;
+            file.sync_all().await?;
+            GraphResult::Ok(())
         }
-        file.flush().await?;
-        info!("Downloaded item {item_id} to {dest:?}");
-        Ok(())
+        .await;
+
+        match result {
+            Ok(()) => {
+                tokio::fs::rename(&tmp_path, dest).await?;
+                info!("Downloaded item {item_id} to {dest:?}");
+                Ok(())
+            }
+            Err(e) => {
+                // Clean up partial temp file on failure.
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                Err(e)
+            }
+        }
     }
 
     // ── Upload ─────────────────────────────────────────────────────────────────

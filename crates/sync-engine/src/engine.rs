@@ -183,6 +183,10 @@ impl SyncEngine {
                 warn!("Failed to send SyncCompleted event: {e}");
             }
         }
+
+        // Periodic cleanup: remove stale cache files and tmp leftovers.
+        self.cleanup_cache().await;
+
         Ok(())
     }
 
@@ -454,6 +458,8 @@ impl SyncEngine {
         let lock = self.item_lock(&item.id);
         let _guard = lock.lock().await;
 
+        Self::check_disk_space(local_path)?;
+
         if let Err(e) = self.db.set_sync_state(&item.id, &SyncState::Syncing).await {
             warn!("Failed to set Syncing state for {}: {e}", item.id);
         }
@@ -712,6 +718,8 @@ impl SyncEngine {
             return Ok(());
         }
 
+        Self::check_disk_space(&cache_dir)?;
+
         // Tray: show spinning icon while downloads are in progress.
         if let Err(e) = self.event_tx.send(SyncEvent::SyncStarted) {
             warn!("Failed to send SyncStarted event: {e}");
@@ -840,6 +848,75 @@ impl SyncEngine {
         Ok(())
     }
 
+    // ── Cleanup ────────────────────────────────────────────────────────────────
+
+    /// Remove stale cache files that no longer have a corresponding DB entry,
+    /// and clean up leftover .tmp files from interrupted downloads.
+    /// Also prunes the item_locks DashMap to prevent unbounded growth.
+    pub async fn cleanup_cache(&self) {
+        let cache_dir = match &self.cache_dir {
+            Some(d) => d,
+            None => return,
+        };
+
+        let dir = match std::fs::read_dir(cache_dir) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        let mut removed = 0u64;
+        let mut removed_bytes = 0u64;
+
+        for entry in dir.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n.to_string(),
+                None => continue,
+            };
+
+            // Remove leftover .tmp files from interrupted atomic downloads.
+            if name.ends_with(".tmp") {
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                if let Err(e) = std::fs::remove_file(&path) {
+                    warn!("Cache cleanup: failed to remove tmp file {name}: {e}");
+                } else {
+                    removed += 1;
+                    removed_bytes += size;
+                }
+                continue;
+            }
+
+            // Check if this cache file has a matching DB item.
+            // The file name is the OneDrive item ID.
+            match self.db.get_item_by_id(&name).await {
+                Ok(Some(_)) => {} // Still valid
+                Ok(None) => {
+                    // No DB entry — stale cache file.
+                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    if let Err(e) = std::fs::remove_file(&path) {
+                        warn!("Cache cleanup: failed to remove stale {name}: {e}");
+                    } else {
+                        removed += 1;
+                        removed_bytes += size;
+                    }
+                }
+                Err(_) => {} // DB error — skip, don't delete
+            }
+        }
+
+        // Prune item_locks: remove entries where we're the only holder of the Arc.
+        self.item_locks.retain(|_, v| Arc::strong_count(v) > 1);
+
+        if removed > 0 {
+            let mb = removed_bytes as f64 / (1024.0 * 1024.0);
+            info!("Cache cleanup: removed {removed} stale files ({mb:.1} MB)");
+        }
+    }
+
     // ── Status ─────────────────────────────────────────────────────────────────
 
     pub async fn get_status(&self) -> Vec<(PathBuf, SyncState)> {
@@ -850,6 +927,35 @@ impl SyncEngine {
             .into_iter()
             .map(|i| (i.local_path, i.sync_state))
             .collect()
+    }
+
+    /// Minimum free disk space (100 MB) required before starting a download.
+    const MIN_FREE_BYTES: u64 = 100 * 1024 * 1024;
+
+    /// Check that the filesystem containing `path` has enough free space.
+    /// Returns an error if free space is below MIN_FREE_BYTES.
+    fn check_disk_space(path: &Path) -> anyhow::Result<()> {
+        let dir = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(Path::new("/"))
+        };
+        let c_path = std::ffi::CString::new(dir.to_string_lossy().as_bytes())
+            .unwrap_or_else(|_| std::ffi::CString::new("/").unwrap());
+        unsafe {
+            let mut stat: libc::statvfs = std::mem::zeroed();
+            if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
+                let free = stat.f_bavail as u64 * stat.f_bsize as u64;
+                if free < Self::MIN_FREE_BYTES {
+                    let free_mb = free / (1024 * 1024);
+                    anyhow::bail!(
+                        "Low disk space: {free_mb} MB free on {dir:?} (need at least {} MB)",
+                        Self::MIN_FREE_BYTES / (1024 * 1024)
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Get or create a per-item lock. Prevents concurrent downloads/uploads

@@ -2586,6 +2586,7 @@ dependencies = [
  "futures",
  "graph-client",
  "hex",
+ "libc",
  "notify",
  "parking_lot",
  "rusqlite",
