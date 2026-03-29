@@ -139,6 +139,14 @@ impl Database {
     pub async fn upsert_item(&self, item: &DbItem) -> Result<()> {
         let item = item.clone();
         self.with_conn(move |conn| {
+            // If another item already occupies this local_path (e.g. a stale entry
+            // from a previous delta sync with a different item ID), remove it first.
+            // This prevents UNIQUE constraint violations on local_path when FUSE
+            // creates new items that shadow stale DB entries.
+            conn.execute(
+                "DELETE FROM items WHERE local_path = ?1 AND id != ?2",
+                params![item.local_path.to_string_lossy().as_ref(), item.id],
+            )?;
             conn.execute(
                 // `pinned` is intentionally excluded from the ON CONFLICT UPDATE clause —
                 // it is user-controlled and must never be overwritten by delta sync.

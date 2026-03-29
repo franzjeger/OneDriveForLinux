@@ -828,16 +828,29 @@ impl Filesystem for OneDriveFS {
 
                     // Upload in background — release() must return immediately so
                     // the kernel doesn't block the calling process (e.g. Dolphin).
+                    let cache_dir = self.cache_dir.clone();
+                    let is_temp_item = id.starts_with("_local_");
                     tokio::spawn(async move {
                         if let Some(parent_id) = item.parent_id.clone() {
                             match graph.upload_file(&parent_id, &item.name, &cache_path).await {
                                 Ok(updated) => {
-                                    let mut updated_item = item;
-                                    updated_item.size = updated.size.unwrap_or_else(|| {
+                                    let new_size = updated.size.unwrap_or_else(|| {
                                         std::fs::metadata(&cache_path)
                                             .map(|m| m.len())
                                             .unwrap_or(0)
                                     });
+
+                                    if is_temp_item {
+                                        // Replace temp DB entry with real OneDrive item.
+                                        let _ = db.delete_item(&item.id).await;
+                                        // Rename cache file from temp ID to real ID.
+                                        let new_cache = cache_dir.join(&updated.id);
+                                        let _ = std::fs::rename(&cache_path, &new_cache);
+                                    }
+
+                                    let mut updated_item = item;
+                                    updated_item.id = updated.id;
+                                    updated_item.size = new_size;
                                     updated_item.etag = updated.e_tag;
                                     updated_item.ctag = updated.c_tag;
                                     updated_item.modified_at = updated.last_modified_date_time;
@@ -848,7 +861,7 @@ impl Filesystem for OneDriveFS {
                                     }
                                     info!(
                                         "upload complete: {} ({} bytes)",
-                                        updated_item.name, updated_item.size
+                                        updated_item.name, new_size
                                     );
                                 }
                                 Err(e) => {
@@ -903,7 +916,10 @@ impl Filesystem for OneDriveFS {
                 libc::EIO
             })?;
 
-        let local_path = self.sync_dir.join(&name_str);
+        // Build full local_path from parent's path, not just sync_dir + name.
+        let parent_path = self.inode_to_path(parent).await
+            .unwrap_or_else(|| self.sync_dir.clone());
+        let local_path = parent_path.join(&name_str);
         let db_item = sync_engine::DbItem {
             id: folder.id.clone(),
             local_path: local_path.clone(),
@@ -958,8 +974,11 @@ impl Filesystem for OneDriveFS {
         };
 
         if let Ok(Some(item)) = self.db.get_child_by_name(&parent_drive_id, &name_str).await {
-            if let Err(e) = self.graph.delete_item(&item.id).await {
-                warn!("Failed to delete remote item {}: {e}", item.id);
+            // Skip Graph API call for local-only temp items.
+            if !item.id.starts_with("_local_") {
+                if let Err(e) = self.graph.delete_item(&item.id).await {
+                    warn!("Failed to delete remote item {}: {e}", item.id);
+                }
             }
             if let Err(e) = self.db.delete_item(&item.id).await {
                 warn!("Failed to delete DB item {}: {e}", item.id);
@@ -1014,6 +1033,29 @@ impl Filesystem for OneDriveFS {
         };
 
         if let Ok(Some(item)) = self.db.get_child_by_name(&old_parent_drive_id, &old_name).await {
+            // Local-only temp items: rename locally without Graph API call.
+            if item.id.starts_with("_local_") {
+                let new_parent_path = self.inode_to_path(parent).await
+                    .unwrap_or_else(|| self.sync_dir.clone());
+                let new_local_path = new_parent_path.join(new_name.as_ref());
+                let mut updated = item.clone();
+                updated.name = new_name.to_string();
+                updated.local_path = new_local_path;
+                updated.parent_id = Some(new_parent_drive_id);
+                // Delete old entry and insert updated one.
+                let _ = self.db.delete_item(&item.id).await;
+                if let Err(e) = self.db.upsert_item(&updated).await {
+                    warn!("Failed to upsert renamed temp item: {e}");
+                }
+                // Rename cache file.
+                let old_cache = self.cache_dir.join(&item.id);
+                let new_cache = self.cache_dir.join(&item.id);
+                if old_cache.exists() && old_cache != new_cache {
+                    let _ = std::fs::rename(&old_cache, &new_cache);
+                }
+                return Ok(());
+            }
+
             match self
                 .graph
                 .move_item(&item.id, &new_parent_drive_id, &new_name)
@@ -1121,68 +1163,67 @@ impl Filesystem for OneDriveFS {
             let map = self.inodes.read().await;
             match map.get(&parent).map(|e| e.item_id.clone()) {
                 Some(id) => id,
-                None => self
-                    .graph
-                    .get_drive_root()
-                    .await
-                    .map_err(|_| libc::EIO)?
-                    .id,
+                None => match self.drive_parent_id(parent).await {
+                    Some(id) => id,
+                    None => self
+                        .graph
+                        .get_drive_root()
+                        .await
+                        .map_err(|_| libc::EIO)?
+                        .id,
+                },
             }
         };
 
-        // Create an empty file in the cache dir (outside the FUSE mount) and upload
-        // from there. Creating at local_path (inside the FUSE mount) from within the
-        // FUSE handler would cause a recursive FUSE deadlock.
-        let tmp_path = self.cache_dir.join(format!("new_{name_str}"));
-        std::fs::File::create(&tmp_path).map_err(|_| libc::EIO)?;
-        let local_path = self.sync_dir.join(&name_str);
+        // Build full local_path from parent's path.
+        let parent_path = self.inode_to_path(parent).await
+            .unwrap_or_else(|| self.sync_dir.clone());
+        let local_path = parent_path.join(&name_str);
 
-        let item = self
-            .graph
-            .upload_file(&parent_id, &name_str, &tmp_path)
-            .await
-            .map_err(|e| {
-                error!("upload on create: {e}");
-                libc::EIO
-            })?;
-
-        let db_item = DbItem {
-            id: item.id.clone(),
-            local_path: local_path.clone(),
-            name: name_str,
-            parent_id: Some(parent_id),
-            etag: item.e_tag.clone(),
-            ctag: item.c_tag.clone(),
-            size: 0,
-            modified_at: item.last_modified_date_time,
-            created_at: item.created_date_time,
-            sha1_hash: None,
-            quick_xor_hash: None,
-            is_folder: false,
-            is_placeholder: false,
-            sync_state: SyncState::Synced,
-            pinned: false,
-        };
-        if let Err(e) = self.db.upsert_item(&db_item).await {
-            error!("Failed to upsert item on create: {e}");
-        }
-
-        // Move tmp file to the canonical cache path now that we have the item id.
-        let cache_path = self.cache_dir.join(&item.id);
-        if let Err(e) = std::fs::rename(&tmp_path, &cache_path) {
-            warn!("Failed to rename tmp cache file: {e}");
-        }
-
-        let ino = self.get_or_create_inode(&item.id, parent, false).await;
-        let fh = self.next_fh();
+        // Local-first create: assign a temporary item ID, create the cache file
+        // immediately, and upload in the background. This matches Mac OneDrive
+        // behavior — files are instantly available after creation without waiting
+        // for the Graph API round-trip.
+        let tmp_item_id = format!("_local_{}", INODE_COUNTER.fetch_add(1, Ordering::SeqCst));
+        let cache_path = self.cache_dir.join(&tmp_item_id);
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .truncate(false)
+            .truncate(true)
             .open(&cache_path)
-            .map_err(|e| { error!("open cache on create: {e}"); libc::EIO })?;
+            .map_err(|e| {
+                error!("create cache file {cache_path:?}: {e}");
+                libc::EIO
+            })?;
+
+        // Insert a temporary DB entry so lookup/getattr/readdir find this file.
+        let db_item = DbItem {
+            id: tmp_item_id.clone(),
+            local_path: local_path.clone(),
+            name: name_str.clone(),
+            parent_id: Some(parent_id.clone()),
+            etag: None,
+            ctag: None,
+            size: 0,
+            modified_at: Some(chrono::Utc::now()),
+            created_at: Some(chrono::Utc::now()),
+            sha1_hash: None,
+            quick_xor_hash: None,
+            is_folder: false,
+            is_placeholder: false,
+            sync_state: SyncState::Syncing,
+            pinned: false,
+        };
+        if let Err(e) = self.db.upsert_item(&db_item).await {
+            error!("Failed to upsert temp item on create: {e}");
+        }
+
+        let ino = self.get_or_create_inode(&tmp_item_id, parent, false).await;
+        let fh = self.next_fh();
         self.open_files.write().await.insert(fh, file);
+        // Mark dirty so release() uploads the file content.
+        self.dirty_fhs.write().await.insert(fh);
         let now_ts = Timestamp::from(SystemTime::now());
 
         Ok(ReplyCreated {
