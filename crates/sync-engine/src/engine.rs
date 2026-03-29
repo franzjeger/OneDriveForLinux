@@ -6,7 +6,7 @@ use crate::{
 };
 use chrono::Utc;
 use dashmap::DashMap;
-use graph_client::{DriveItem, GraphClient};
+use graph_client::{AuthManager, DriveItem, GraphClient, GraphError};
 use std::{path::Path, path::PathBuf, sync::{Arc, atomic::{AtomicUsize, Ordering}}, time::Instant};
 use tokio::sync::{broadcast, Mutex as TokioMutex, RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
@@ -15,6 +15,7 @@ pub struct SyncEngine {
     config: Arc<Config>,
     db: Arc<Database>,
     graph: Arc<GraphClient>,
+    auth: Arc<AuthManager>,
     event_tx: broadcast::Sender<SyncEvent>,
     paused: Arc<RwLock<bool>>,
     /// Cache directory for on-demand file storage (outside the FUSE mountpoint).
@@ -29,6 +30,7 @@ impl SyncEngine {
         config: Arc<Config>,
         db: Arc<Database>,
         graph: Arc<GraphClient>,
+        auth: Arc<AuthManager>,
         cache_dir: Option<std::path::PathBuf>,
     ) -> (Self, broadcast::Receiver<SyncEvent>) {
         let (event_tx, event_rx) = broadcast::channel(256);
@@ -36,6 +38,7 @@ impl SyncEngine {
             config,
             db,
             graph,
+            auth,
             event_tx,
             paused: Arc::new(RwLock::new(false)),
             cache_dir,
@@ -129,8 +132,12 @@ impl SyncEngine {
             if !self.is_paused().await {
                 if let Err(e) = self.run_delta_sync().await {
                     error!("Delta sync error: {e}");
-                    if let Err(e) = self.event_tx.send(SyncEvent::Error(e.to_string())) {
-                        warn!("Failed to send Error event: {e}");
+                    if self.is_auth_error(&e) {
+                        error!("Authentication failed — pausing sync. Run `onedrive-linux auth` to re-authenticate.");
+                        self.pause().await;
+                        let _ = self.event_tx.send(SyncEvent::AuthRequired);
+                    } else {
+                        let _ = self.event_tx.send(SyncEvent::Error(e.to_string()));
                     }
                 }
             }
@@ -139,6 +146,39 @@ impl SyncEngine {
             ))
             .await;
         }
+    }
+
+    /// Returns true if the error is an authentication/authorization failure.
+    fn is_auth_error(&self, e: &anyhow::Error) -> bool {
+        if let Some(ge) = e.downcast_ref::<GraphError>() {
+            return matches!(ge, GraphError::Auth(_) | GraphError::TokenRefresh(_));
+        }
+        false
+    }
+
+    /// Trigger re-authentication via device code flow.
+    /// Returns (message, user_code, verification_uri) for display to the user.
+    /// Polls for the token in the background and auto-resumes sync when done.
+    pub async fn start_reauthenticate(self: Arc<Self>) -> anyhow::Result<(String, String, String)> {
+        let dc = self.auth.start_device_code_flow().await?;
+        let info = (dc.message.clone(), dc.user_code.clone(), dc.verification_uri.clone());
+
+        let auth = Arc::clone(&self.auth);
+        let engine = Arc::clone(&self);
+        tokio::spawn(async move {
+            match auth.complete_device_auth(dc).await {
+                Ok(()) => {
+                    info!("Re-authentication complete — resuming sync");
+                    engine.resume().await;
+                }
+                Err(e) => {
+                    error!("Re-authentication failed: {e}");
+                    let _ = engine.event_tx.send(SyncEvent::Error(format!("Re-auth failed: {e}")));
+                }
+            }
+        });
+
+        Ok(info)
     }
 
     async fn run_delta_sync(&self) -> anyhow::Result<()> {

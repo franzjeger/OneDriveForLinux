@@ -120,6 +120,7 @@ async fn main() -> Result<()> {
         Arc::clone(&config),
         Arc::clone(&db),
         Arc::clone(&graph),
+        Arc::clone(&auth),
         engine_cache_dir,
     );
     let engine = Arc::new(engine);

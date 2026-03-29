@@ -18,6 +18,7 @@ trait OneDriveControl {
     async fn is_paused(&self) -> zbus::Result<bool>;
     async fn pin_item(&self, path: String) -> zbus::Result<()>;
     async fn unpin_item(&self, path: String) -> zbus::Result<()>;
+    async fn start_auth(&self) -> zbus::Result<(String, String, String)>;
 }
 
 // ── CLI definition ─────────────────────────────────────────────────────────────
@@ -244,13 +245,33 @@ async fn cmd_auth(signout: bool) -> Result<()> {
             println!("Not signed in (no tokens.json found).");
         }
     } else {
-        let tokens_path = dirs::config_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("/root/.config"))
-            .join("onedrive-linux")
-            .join("tokens.json");
-        println!("To re-authenticate, stop the daemon and delete:");
-        println!("  {tokens_path:?}");
-        println!("Then restart the daemon — the device code flow will start automatically.");
+        // Try to trigger re-auth via the running daemon.
+        match Connection::session().await {
+            Ok(conn) => match make_proxy(&conn).await {
+                Ok(proxy) => {
+                    println!("Requesting re-authentication from daemon...");
+                    match proxy.start_auth().await {
+                        Ok((message, _user_code, _verification_uri)) => {
+                            println!("{message}");
+                            println!("\nWaiting for authentication to complete...");
+                            println!("(The daemon will resume sync automatically when done.)");
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to start auth via daemon: {e}");
+                            eprintln!("Is the daemon running? Try restarting it.");
+                        }
+                    }
+                }
+                Err(_) => {
+                    eprintln!("Daemon not reachable via D-Bus.");
+                    eprintln!("Restart the daemon to trigger re-authentication.");
+                }
+            },
+            Err(e) => {
+                eprintln!("D-Bus session not available: {e}");
+                eprintln!("Restart the daemon to trigger re-authentication.");
+            }
+        }
     }
     Ok(())
 }

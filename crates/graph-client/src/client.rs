@@ -81,6 +81,21 @@ impl GraphClient {
                     let status = resp.status().as_u16();
                     match status {
                         200..=299 => return Ok(resp),
+                        401 => {
+                            if attempt > 1 {
+                                // Already retried once after a refresh — give up.
+                                return Err(GraphError::Auth(
+                                    "401 Unauthorized after token refresh — re-authentication required".into(),
+                                ));
+                            }
+                            warn!("Got 401, forcing token refresh (attempt {attempt})");
+                            if let Err(e) = self.auth.force_refresh().await {
+                                return Err(GraphError::Auth(format!(
+                                    "Token refresh failed after 401: {e} — re-authentication required"
+                                )));
+                            }
+                            // Retry with the new token.
+                        }
                         429 => {
                             let retry_secs = resp
                                 .headers()

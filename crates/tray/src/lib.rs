@@ -22,6 +22,7 @@ enum TrayStatus {
     Syncing,
     Error(String),
     Paused,
+    AuthRequired,
 }
 
 impl TrayStatus {
@@ -31,6 +32,7 @@ impl TrayStatus {
             TrayStatus::Syncing => ICON_SYNCING,
             TrayStatus::Error(_) => ICON_ERROR,
             TrayStatus::Paused => ICON_PAUSED,
+            TrayStatus::AuthRequired => ICON_ERROR,
         }
     }
 
@@ -40,6 +42,7 @@ impl TrayStatus {
             TrayStatus::Syncing => "OneDrive — Syncing…".into(),
             TrayStatus::Error(e) => format!("OneDrive — Error: {e}"),
             TrayStatus::Paused => "OneDrive — Paused".into(),
+            TrayStatus::AuthRequired => "OneDrive — Sign in required".into(),
         }
     }
 
@@ -115,6 +118,7 @@ impl Tray for OneDriveTray {
         let sync_dir = st.sync_dir.clone();
         let config_path = st.config_path.clone();
         let is_paused = st.status.is_paused();
+        let auth_required = matches!(st.status, TrayStatus::AuthRequired);
         let recent: Vec<_> = st.recent.iter().cloned().collect();
         drop(st); // release lock before building closures
 
@@ -134,6 +138,30 @@ impl Tray for OneDriveTray {
             }
             .into(),
         );
+
+        // Sign in again — shown only when authentication has failed
+        if auth_required {
+            items.push(MenuItem::Separator);
+            items.push(
+                StandardItem {
+                    label: "Sign in again…".into(),
+                    icon_name: "dialog-password".into(),
+                    activate: Box::new(|_| {
+                        // Open a terminal to run `odctl auth` so the user can see the device code.
+                        for terminal in &["konsole", "gnome-terminal", "xterm"] {
+                            let result = std::process::Command::new(terminal)
+                                .args(["-e", "odctl auth"])
+                                .spawn();
+                            if result.is_ok() {
+                                break;
+                            }
+                        }
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
 
         items.push(MenuItem::Separator);
 
@@ -284,8 +312,7 @@ pub fn spawn_tray(
                             st.status = TrayStatus::Error(msg);
                         }
                         SyncEvent::AuthRequired => {
-                            st.status =
-                                TrayStatus::Error("Authentication required".into());
+                            st.status = TrayStatus::AuthRequired;
                         }
                     }
                     drop(st);

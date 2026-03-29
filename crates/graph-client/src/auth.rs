@@ -119,6 +119,21 @@ impl AuthManager {
         Ok(())
     }
 
+    /// Start the device code flow and return the response (user_code, verification_uri, etc.)
+    /// for display to the user. Call `complete_device_auth(dc)` to poll for the token.
+    pub async fn start_device_code_flow(&self) -> Result<DeviceCodeResponse> {
+        self.request_device_code().await
+    }
+
+    /// Poll for token after device code flow was initiated with `start_device_code_flow()`.
+    /// Saves the token when received. Returns Ok(()) when authenticated.
+    pub async fn complete_device_auth(&self, dc: DeviceCodeResponse) -> Result<()> {
+        let ts = self.poll_for_token(&dc).await?;
+        self.save_token(ts).await?;
+        info!("Re-authentication successful");
+        Ok(())
+    }
+
     async fn request_device_code(&self) -> Result<DeviceCodeResponse> {
         let url = DEVICE_CODE_ENDPOINT.replace("{tenant}", &self.tenant_id);
         let params = [
@@ -197,6 +212,13 @@ impl AuthManager {
         }
 
         // Slow path: refresh
+        self.refresh_token_inner().await
+    }
+
+    /// Force a token refresh regardless of expiry, e.g. after a 401 response.
+    /// Returns the new access token, or an error if the refresh token is missing
+    /// or has been revoked (user must re-authenticate).
+    pub async fn force_refresh(&self) -> Result<String> {
         self.refresh_token_inner().await
     }
 

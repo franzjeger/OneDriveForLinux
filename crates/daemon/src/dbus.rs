@@ -58,6 +58,17 @@ impl OneDriveInterface {
         Ok(())
     }
 
+    /// Start the OAuth2 device code re-authentication flow.
+    /// Returns (message, user_code, verification_uri) to display to the user.
+    /// The daemon polls for the token in background and auto-resumes sync when done.
+    async fn start_auth(&self) -> zbus::fdo::Result<(String, String, String)> {
+        info!("D-Bus: StartAuth");
+        Arc::clone(&self.engine)
+            .start_reauthenticate()
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))
+    }
+
     /// Remove pin from a file or folder, free cache space, convert to cloud-only.
     async fn unpin_item(&self, path: String) -> zbus::fdo::Result<()> {
         info!("D-Bus: UnpinItem {path}");
