@@ -165,20 +165,21 @@ async fn cmd_sync(path: Option<String>) -> Result<()> {
     let proxy = make_proxy(&conn).await?;
 
     let target = match path {
-        Some(p) => std::fs::canonicalize(&p)
-            .unwrap_or_else(|_| std::path::PathBuf::from(&p))
-            .to_string_lossy()
-            .to_string(),
+        Some(p) => absolutize(&p),
         None => {
             // Read sync_dir from config file
             let cfg_path = config_path();
             let raw = std::fs::read_to_string(&cfg_path)
                 .with_context(|| format!("read config {cfg_path:?}"))?;
             let val: toml::Value = toml::from_str(&raw).context("parse config")?;
-            val.get("sync_dir")
-                .and_then(|v| v.as_str())
-                .unwrap_or("~/OneDrive")
-                .to_string()
+            match val.get("sync_dir").and_then(|v| v.as_str()) {
+                Some(dir) => dir.to_string(),
+                None => dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/root"))
+                    .join("OneDrive")
+                    .to_string_lossy()
+                    .to_string(),
+            }
         }
     };
 
@@ -194,10 +195,7 @@ async fn cmd_pin(paths: Vec<String>) -> Result<()> {
     let conn = Connection::session().await.context("connect to D-Bus")?;
     let proxy = make_proxy(&conn).await?;
     for path in paths {
-        let abs = std::fs::canonicalize(&path)
-            .unwrap_or_else(|_| std::path::PathBuf::from(&path))
-            .to_string_lossy()
-            .to_string();
+        let abs = absolutize(&path);
         proxy
             .pin_item(abs.clone())
             .await
@@ -211,10 +209,7 @@ async fn cmd_unpin(paths: Vec<String>) -> Result<()> {
     let conn = Connection::session().await.context("connect to D-Bus")?;
     let proxy = make_proxy(&conn).await?;
     for path in paths {
-        let abs = std::fs::canonicalize(&path)
-            .unwrap_or_else(|_| std::path::PathBuf::from(&path))
-            .to_string_lossy()
-            .to_string();
+        let abs = absolutize(&path);
         proxy
             .unpin_item(abs.clone())
             .await
@@ -301,15 +296,21 @@ async fn cmd_pin_status(path_filter: Option<String>) -> Result<()> {
     .with_context(|| format!("open database {db_path:?}"))?;
 
     let query = if path_filter.is_some() {
-        "SELECT id, local_path, name, size, is_placeholder FROM items WHERE pinned = 1 AND is_folder = 0 AND local_path LIKE ?1 ORDER BY local_path"
+        "SELECT id, local_path, name, size, is_placeholder FROM items WHERE pinned = 1 AND is_folder = 0 AND local_path LIKE ?1 ESCAPE '\\' ORDER BY local_path"
     } else {
         "SELECT id, local_path, name, size, is_placeholder FROM items WHERE pinned = 1 AND is_folder = 0 ORDER BY local_path"
     };
 
     let mut stmt = conn.prepare(query)?;
     let rows: Vec<(String, String, String, i64, bool)> = if let Some(ref p) = path_filter {
-        let abs = std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
-        let like = format!("{}%", abs.to_string_lossy());
+        let abs = absolutize(p);
+        // Escape LIKE wildcards so a path containing % or _ can't over-match.
+        let like = format!(
+            "{}%",
+            abs.replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
         stmt.query_map(rusqlite::params![like], |row| {
             Ok((
                 row.get(0)?,
@@ -390,6 +391,14 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+/// Best-effort absolute path: canonicalize, falling back to the raw input.
+fn absolutize(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| std::path::PathBuf::from(path))
+        .to_string_lossy()
+        .to_string()
 }
 
 fn config_path() -> std::path::PathBuf {
