@@ -101,6 +101,20 @@ impl AuthManager {
         })
     }
 
+    /// Test-only constructor with a pre-seeded token and isolated token path,
+    /// so tests never touch the real config directory or the network.
+    #[cfg(test)]
+    pub(crate) fn for_tests(token: TokenSet, token_path: PathBuf) -> Self {
+        Self {
+            client_id: "test-client".into(),
+            tenant_id: "common".into(),
+            http: reqwest::Client::new(),
+            token: RwLock::new(Some(token)),
+            token_path,
+            refresh_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
     /// Returns true if we already have a valid (or refreshable) token.
     pub async fn is_authenticated(&self) -> bool {
         self.token.read().await.is_some()

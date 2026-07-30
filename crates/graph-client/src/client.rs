@@ -46,6 +46,8 @@ const RETRY_BASE_DELAY_SECS: u64 = 2;
 pub struct GraphClient {
     http: reqwest::Client,
     auth: Arc<AuthManager>,
+    /// Graph API base URL — overridable so tests can target a mock server.
+    base_url: String,
 }
 
 impl GraphClient {
@@ -56,7 +58,18 @@ impl GraphClient {
             .timeout(std::time::Duration::from_secs(300))
             .build()
             .expect("build reqwest client");
-        Self { http, auth }
+        Self {
+            http,
+            auth,
+            base_url: GRAPH_BASE.to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_base_url(auth: Arc<AuthManager>, base_url: String) -> Self {
+        let mut client = Self::new(auth);
+        client.base_url = base_url;
+        client
     }
 
     // ── Auth helper ────────────────────────────────────────────────────────────
@@ -178,7 +191,7 @@ impl GraphClient {
     // ── Drive root ─────────────────────────────────────────────────────────────
 
     pub async fn get_drive_root(&self) -> GraphResult<DriveItem> {
-        let url = format!("{GRAPH_BASE}/me/drive/root");
+        let url = format!("{}/me/drive/root", self.base_url);
         debug!("GET {url}");
         self.get_json(&url).await
     }
@@ -188,9 +201,10 @@ impl GraphClient {
     pub async fn list_children(&self, item_id: &str) -> GraphResult<Vec<DriveItem>> {
         let mut items = Vec::new();
         let mut url = format!(
-            "{GRAPH_BASE}/me/drive/items/{item_id}/children\
+            "{}/me/drive/items/{item_id}/children\
              ?$select=id,name,eTag,cTag,size,createdDateTime,lastModifiedDateTime,\
-             file,folder,parentReference,fileSystemInfo,deleted"
+             file,folder,parentReference,fileSystemInfo,deleted",
+            self.base_url
         );
 
         loop {
@@ -219,7 +233,7 @@ impl GraphClient {
             // remoteItem, etc.) are returned reliably. With $select the Graph API
             // sometimes silently drops facets like `folder` for delta responses,
             // causing folders to be misidentified as files.
-            None => format!("{GRAPH_BASE}/me/drive/items/{folder_id}/delta"),
+            None => format!("{}/me/drive/items/{folder_id}/delta", self.base_url),
         };
 
         debug!("delta url: {url}");
@@ -272,7 +286,7 @@ impl GraphClient {
     // ── Download ───────────────────────────────────────────────────────────────
 
     pub async fn download_file(&self, item_id: &str, dest: &Path) -> GraphResult<()> {
-        let url = format!("{GRAPH_BASE}/me/drive/items/{item_id}/content");
+        let url = format!("{}/me/drive/items/{item_id}/content", self.base_url);
         debug!("download_file({item_id}) -> {dest:?}");
 
         let resp = self
@@ -349,7 +363,8 @@ impl GraphClient {
         path: &Path,
     ) -> GraphResult<DriveItem> {
         let url = format!(
-            "{GRAPH_BASE}/me/drive/items/{parent_id}:/{}:/content",
+            "{}/me/drive/items/{parent_id}:/{}:/content",
+            self.base_url,
             encode_name(name)
         );
         debug!("upload_small -> {url}");
@@ -388,7 +403,8 @@ impl GraphClient {
         _size: u64,
     ) -> GraphResult<UploadSession> {
         let url = format!(
-            "{GRAPH_BASE}/me/drive/items/{parent_id}:/{}:/createUploadSession",
+            "{}/me/drive/items/{parent_id}:/{}:/createUploadSession",
+            self.base_url,
             encode_name(name)
         );
         let body = CreateUploadSessionRequest {
@@ -516,7 +532,7 @@ impl GraphClient {
     // ── Folder / item operations ───────────────────────────────────────────────
 
     pub async fn create_folder(&self, parent_id: &str, name: &str) -> GraphResult<DriveItem> {
-        let url = format!("{GRAPH_BASE}/me/drive/items/{parent_id}/children");
+        let url = format!("{}/me/drive/items/{parent_id}/children", self.base_url);
         let body = CreateFolderRequest {
             name: name.to_string(),
             folder: serde_json::json!({}),
@@ -542,7 +558,7 @@ impl GraphClient {
     }
 
     pub async fn delete_item(&self, item_id: &str) -> GraphResult<()> {
-        let url = format!("{GRAPH_BASE}/me/drive/items/{item_id}");
+        let url = format!("{}/me/drive/items/{item_id}", self.base_url);
         let resp = self
             .request_with_retry(|| async {
                 let token = self.bearer().await?;
@@ -568,7 +584,7 @@ impl GraphClient {
         new_parent_id: &str,
         new_name: &str,
     ) -> GraphResult<DriveItem> {
-        let url = format!("{GRAPH_BASE}/me/drive/items/{item_id}");
+        let url = format!("{}/me/drive/items/{item_id}", self.base_url);
         let body = MoveItemRequest {
             parent_reference: MoveParentReference {
                 id: new_parent_id.to_string(),
@@ -614,5 +630,215 @@ mod tests {
     #[test]
     fn unicode_is_preserved_via_utf8_encoding() {
         assert_eq!(encode_name("møte.txt"), "m%C3%B8te.txt");
+    }
+}
+
+/// Mock-server tests exercising the real HTTP paths: pagination, retry,
+/// downloads, uploads, and error mapping.
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use crate::auth::TokenSet;
+    use wiremock::matchers::{header, method, path, query_param_is_missing};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn test_client(server_uri: &str, dir: &std::path::Path) -> GraphClient {
+        let token = TokenSet {
+            access_token: "test-token".into(),
+            refresh_token: Some("refresh".into()),
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            token_type: "Bearer".into(),
+            scope: "Files.ReadWrite.All".into(),
+        };
+        let auth = Arc::new(AuthManager::for_tests(token, dir.join("tokens.json")));
+        GraphClient::with_base_url(auth, server_uri.to_string())
+    }
+
+    #[tokio::test]
+    async fn get_drive_root_sends_bearer_token() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        Mock::given(method("GET"))
+            .and(path("/me/drive/root"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "root-id", "name": "root", "folder": {}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), dir.path());
+        let root = client.get_drive_root().await.unwrap();
+        assert_eq!(root.id, "root-id");
+    }
+
+    #[tokio::test]
+    async fn delta_follows_next_link_and_returns_delta_link() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+
+        // Page 1 points at page 2 via @odata.nextLink.
+        Mock::given(method("GET"))
+            .and(path("/me/drive/items/root/delta"))
+            .and(query_param_is_missing("page"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "value": [{"id": "a", "name": "a.txt", "file": {}}],
+                "@odata.nextLink": format!("{}/me/drive/items/root/delta?page=2", server.uri())
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/me/drive/items/root/delta"))
+            .and(wiremock::matchers::query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "value": [{"id": "b", "name": "b.txt", "file": {}}],
+                "@odata.deltaLink": "https://example/delta?token=final"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), dir.path());
+        let resp = client.get_delta("root", None).await.unwrap();
+        assert_eq!(resp.items.len(), 2);
+        assert_eq!(
+            resp.delta_link.as_deref(),
+            Some("https://example/delta?token=final")
+        );
+    }
+
+    #[tokio::test]
+    async fn delta_skips_unparseable_items_instead_of_failing() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        Mock::given(method("GET"))
+            .and(path("/me/drive/items/root/delta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "value": [
+                    {"id": "good", "name": "ok.txt", "file": {}},
+                    {"name": "missing-id-field"}
+                ],
+                "@odata.deltaLink": "https://example/delta"
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), dir.path());
+        let resp = client.get_delta("root", None).await.unwrap();
+        assert_eq!(resp.items.len(), 1);
+        assert_eq!(resp.items[0].id, "good");
+    }
+
+    #[tokio::test]
+    async fn transient_503_is_retried_until_success() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        // First response 503, subsequent 200 — up_to_n_times consumes the mock.
+        Mock::given(method("GET"))
+            .and(path("/me/drive/root"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/me/drive/root"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "root-id", "name": "root", "folder": {}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), dir.path());
+        let root = client.get_drive_root().await.unwrap();
+        assert_eq!(root.id, "root-id");
+    }
+
+    #[tokio::test]
+    async fn missing_item_maps_to_not_found() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        Mock::given(method("GET"))
+            .and(path("/me/drive/root"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), dir.path());
+        let err = client.get_drive_root().await.unwrap_err();
+        assert!(matches!(err, GraphError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn api_error_includes_response_body() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        Mock::given(method("GET"))
+            .and(path("/me/drive/root"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"error": {"code": "invalidRequest"}})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), dir.path());
+        let err = client.get_drive_root().await.unwrap_err();
+        match err {
+            GraphError::Api { status, message } => {
+                assert_eq!(status, 400);
+                assert!(message.contains("invalidRequest"));
+            }
+            other => panic!("expected Api error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn download_file_writes_atomically() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        Mock::given(method("GET"))
+            .and(path("/me/drive/items/item1/content"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello world".to_vec()))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), dir.path());
+        let dest = dir.path().join("out.txt");
+        client.download_file("item1", &dest).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello world");
+        // No leftover temp file.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upload_small_puts_percent_encoded_name() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.txt");
+        std::fs::write(&src, b"data").unwrap();
+
+        // Name with a space and '#': URL path must carry the encoded form.
+        Mock::given(method("PUT"))
+            .and(wiremock::matchers::path_regex(
+                r"^/me/drive/items/parent1:/a(%20| )b%23\.txt:/content$",
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "id": "new-item", "name": "a b#.txt", "size": 4, "file": {}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), dir.path());
+        let item = client
+            .upload_file("parent1", "a b#.txt", &src)
+            .await
+            .unwrap();
+        assert_eq!(item.id, "new-item");
     }
 }

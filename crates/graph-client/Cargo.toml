@@ -18,3 +18,7 @@ futures.workspace = true
 tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1"
 dirs.workspace = true
+
+[dev-dependencies]
+wiremock = "0.6"
+tempfile = "3"
