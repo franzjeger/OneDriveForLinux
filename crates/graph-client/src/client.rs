@@ -13,6 +13,27 @@ use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
 
 const GRAPH_BASE: &str = "https://graph.microsoft.com/v1.0";
+
+/// Characters that must be percent-encoded when a file name is embedded in a
+/// URL path segment. Without this, names containing `#`, `?`, `%`, etc. are
+/// silently misinterpreted by the Graph API.
+const PATH_SEGMENT_ENCODE: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'%')
+    .add(b'/')
+    .add(b'\\');
+
+fn encode_name(name: &str) -> String {
+    percent_encoding::utf8_percent_encode(name, PATH_SEGMENT_ENCODE).to_string()
+}
 /// Files larger than this use an upload session.
 const LARGE_FILE_THRESHOLD: u64 = 4 * 1024 * 1024; // 4 MB
 /// Chunk size for upload sessions (must be multiple of 320 KiB per Graph API).
@@ -122,9 +143,18 @@ impl GraphClient {
                             tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                         }
                         _ => {
+                            // Graph returns a JSON error body with the actual
+                            // failure reason — include it for diagnosability.
+                            let reason = resp.status().canonical_reason().unwrap_or("unknown");
+                            let body = resp.text().await.unwrap_or_default();
+                            let body: String = body.chars().take(512).collect();
                             return Err(GraphError::Api {
                                 status,
-                                message: resp.status().canonical_reason().unwrap_or("unknown").into(),
+                                message: if body.is_empty() {
+                                    reason.into()
+                                } else {
+                                    format!("{reason}: {body}")
+                                },
                             });
                         }
                     }
@@ -194,9 +224,8 @@ impl GraphClient {
         // Collect all pages into one response so callers get a complete batch.
         let mut all_items = Vec::new();
         let mut current_url = url;
-        let mut final_delta_link: Option<String> = None;
 
-        loop {
+        let final_delta_link = loop {
             let resp = self.request_with_retry(|| async {
                 let token = self.bearer().await?;
                 let resp = self
@@ -224,10 +253,9 @@ impl GraphClient {
             if let Some(next) = next_link {
                 current_url = next;
             } else {
-                final_delta_link = delta_link;
-                break;
+                break delta_link;
             }
-        }
+        };
 
         Ok(DeltaResponse {
             items: all_items,
@@ -318,7 +346,10 @@ impl GraphClient {
         name: &str,
         path: &Path,
     ) -> GraphResult<DriveItem> {
-        let url = format!("{GRAPH_BASE}/me/drive/items/{parent_id}:/{name}:/content");
+        let url = format!(
+            "{GRAPH_BASE}/me/drive/items/{parent_id}:/{}:/content",
+            encode_name(name)
+        );
         debug!("upload_small -> {url}");
 
         let data = tokio::fs::read(path).await?;
@@ -353,7 +384,8 @@ impl GraphClient {
         _size: u64,
     ) -> GraphResult<UploadSession> {
         let url = format!(
-            "{GRAPH_BASE}/me/drive/items/{parent_id}:/{name}:/createUploadSession"
+            "{GRAPH_BASE}/me/drive/items/{parent_id}:/{}:/createUploadSession",
+            encode_name(name)
         );
         let body = CreateUploadSessionRequest {
             item: UploadSessionItem {
@@ -384,59 +416,95 @@ impl GraphClient {
         path: &Path,
         total_size: u64,
     ) -> GraphResult<DriveItem> {
-        let data = tokio::fs::read(path).await?;
-        let mut offset = 0usize;
+        use tokio::io::AsyncReadExt;
 
-        loop {
-            let end = (offset + UPLOAD_CHUNK_SIZE).min(data.len());
-            let chunk = &data[offset..end];
+        // Stream the file chunk-by-chunk — this path handles files above the
+        // small-upload threshold, which can be arbitrarily large, so the whole
+        // file must never be held in memory at once.
+        let mut file = tokio::fs::File::open(path).await?;
+        let mut offset: u64 = 0;
+        let mut buf = vec![0u8; UPLOAD_CHUNK_SIZE];
+
+        while offset < total_size {
+            let chunk_len = ((total_size - offset) as usize).min(UPLOAD_CHUNK_SIZE);
+            file.read_exact(&mut buf[..chunk_len]).await?;
+            // Bytes clones are refcounted — retries resend without recopying.
+            let chunk = Bytes::copy_from_slice(&buf[..chunk_len]);
+            let end = offset + chunk_len as u64;
             let range = format!("bytes {}-{}/{}", offset, end - 1, total_size);
             debug!("Uploading chunk: {range}");
 
-            let resp = self
-                .http
-                .put(&session.upload_url)
-                .header("Content-Range", &range)
-                .header("Content-Length", chunk.len().to_string())
-                .body(chunk.to_vec())
-                .send()
-                .await?;
+            let mut attempt = 0u32;
+            loop {
+                attempt += 1;
+                let result = self
+                    .http
+                    .put(&session.upload_url)
+                    .header("Content-Range", &range)
+                    .header("Content-Length", chunk_len.to_string())
+                    .body(chunk.clone())
+                    .send()
+                    .await;
 
-            let status = resp.status().as_u16();
-            match status {
-                200 | 201 => {
-                    // Upload complete — Graph returns the DriveItem
-                    let item: DriveItem = resp.json().await?;
-                    info!("Upload complete via session: id={}", item.id);
-                    return Ok(item);
-                }
-                202 => {
-                    // Chunk accepted, continue
-                    offset = end;
-                    if offset >= data.len() {
-                        warn!("Uploaded all bytes but got 202 — unexpected");
-                        return Err(GraphError::UploadSession(
-                            "unexpected 202 after final chunk".into(),
-                        ));
+                let resp = match result {
+                    Ok(resp) => resp,
+                    Err(e) if (e.is_timeout() || e.is_connect()) && attempt <= MAX_RETRIES => {
+                        let delay = RETRY_BASE_DELAY_SECS * 2u64.pow(attempt - 1);
+                        warn!("Network error uploading {range} ({e}), retry {attempt}/{MAX_RETRIES} after {delay}s");
+                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                        continue;
+                    }
+                    Err(e) => return Err(GraphError::Http(e)),
+                };
+
+                let status = resp.status().as_u16();
+                match status {
+                    200 | 201 => {
+                        // Upload complete — Graph returns the DriveItem
+                        let item: DriveItem = resp.json().await?;
+                        info!("Upload complete via session: id={}", item.id);
+                        return Ok(item);
+                    }
+                    202 => {
+                        // Chunk accepted, continue with the next one.
+                        if end >= total_size {
+                            warn!("Uploaded all bytes but got 202 — unexpected");
+                            return Err(GraphError::UploadSession(
+                                "unexpected 202 after final chunk".into(),
+                            ));
+                        }
+                        break;
+                    }
+                    429 if attempt <= MAX_RETRIES => {
+                        let retry = resp
+                            .headers()
+                            .get("Retry-After")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(30);
+                        warn!("Rate limited during upload, retry {attempt}/{MAX_RETRIES} after {retry}s");
+                        tokio::time::sleep(std::time::Duration::from_secs(retry)).await;
+                    }
+                    500..=504 if attempt <= MAX_RETRIES => {
+                        let delay = RETRY_BASE_DELAY_SECS * 2u64.pow(attempt - 1);
+                        warn!("Server error ({status}) uploading {range}, retry {attempt}/{MAX_RETRIES} after {delay}s");
+                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    }
+                    _ => {
+                        let body = resp.text().await.unwrap_or_default();
+                        return Err(GraphError::UploadSession(format!(
+                            "Unexpected status {status} at range {range}: {}",
+                            body.chars().take(512).collect::<String>()
+                        )));
                     }
                 }
-                429 => {
-                    let retry = resp
-                        .headers()
-                        .get("Retry-After")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .unwrap_or(30);
-                    warn!("Rate limited during upload, sleeping {retry}s");
-                    tokio::time::sleep(std::time::Duration::from_secs(retry)).await;
-                }
-                _ => {
-                    return Err(GraphError::UploadSession(format!(
-                        "Unexpected status {status} at range {range}"
-                    )));
-                }
             }
+            offset = end;
         }
+
+        Err(GraphError::UploadSession(
+            "upload session ended without completion response".into(),
+        ))
     }
 
     // ── Folder / item operations ───────────────────────────────────────────────
@@ -521,5 +589,27 @@ impl GraphClient {
         let item: DriveItem = resp.json().await?;
         info!("Moved item {item_id} -> parent={new_parent_id} name={new_name}");
         Ok(item)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_name;
+
+    #[test]
+    fn plain_names_unchanged() {
+        assert_eq!(encode_name("report.docx"), "report.docx");
+    }
+
+    #[test]
+    fn special_characters_are_escaped() {
+        assert_eq!(encode_name("a b#c?.txt"), "a%20b%23c%3F.txt");
+        assert_eq!(encode_name("50%.txt"), "50%25.txt");
+        assert_eq!(encode_name("a/b"), "a%2Fb");
+    }
+
+    #[test]
+    fn unicode_is_preserved_via_utf8_encoding() {
+        assert_eq!(encode_name("møte.txt"), "m%C3%B8te.txt");
     }
 }

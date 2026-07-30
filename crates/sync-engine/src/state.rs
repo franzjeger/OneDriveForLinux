@@ -85,3 +85,30 @@ pub enum SyncEvent {
     /// Authentication required.
     AuthRequired,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SyncState;
+
+    #[test]
+    fn db_str_roundtrip() {
+        for state in [
+            SyncState::Synced,
+            SyncState::Syncing,
+            SyncState::LocalOnly,
+            SyncState::CloudOnly,
+            SyncState::Conflict,
+            SyncState::Pinned,
+        ] {
+            assert_eq!(SyncState::from_db_str(state.as_db_str()), state);
+        }
+    }
+
+    #[test]
+    fn unknown_db_str_becomes_error() {
+        assert_eq!(
+            SyncState::from_db_str("bogus"),
+            SyncState::Error("bogus".to_string())
+        );
+    }
+}

@@ -282,13 +282,13 @@ impl Database {
             )?;
             let items: Result<Vec<DbItem>, _> = stmt
                 .query_map(params![parent_id], |row| {
-                    Ok(row_to_item(row).map_err(|e| {
+                    row_to_item(row).map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
                             0,
                             rusqlite::types::Type::Text,
-                            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+                            Box::new(std::io::Error::other(e.to_string())),
                         )
-                    })?)
+                    })
                 })?
                 .map(|r| r.map_err(anyhow::Error::from))
                 .collect();
@@ -328,13 +328,13 @@ impl Database {
             )?;
             let items: Result<Vec<DbItem>, _> = stmt
                 .query_map([], |row| {
-                    Ok(row_to_item(row).map_err(|e| {
+                    row_to_item(row).map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
                             0,
                             rusqlite::types::Type::Text,
-                            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+                            Box::new(std::io::Error::other(e.to_string())),
                         )
-                    })?)
+                    })
                 })?
                 .map(|r| r.map_err(anyhow::Error::from))
                 .collect();
@@ -422,13 +422,13 @@ impl Database {
             )?;
             let items: Result<Vec<DbItem>, _> = stmt
                 .query_map(params![glob], |row| {
-                    Ok(row_to_item(row).map_err(|e| {
+                    row_to_item(row).map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
                             0,
                             rusqlite::types::Type::Text,
-                            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+                            Box::new(std::io::Error::other(e.to_string())),
                         )
-                    })?)
+                    })
                 })?
                 .map(|r| r.map_err(anyhow::Error::from))
                 .collect();
@@ -518,16 +518,15 @@ impl Database {
                 )?;
                 let items: Vec<DbItem> = stmt
                     .query_map(params![prefix, glob], |row| {
-                        Ok(row_to_item(row).map_err(|e| {
+                        row_to_item(row).map_err(|e| {
                             rusqlite::Error::FromSqlConversionFailure(
                                 0,
                                 rusqlite::types::Type::Text,
-                                Box::new(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
+                                Box::new(std::io::Error::other(
                                     e.to_string(),
                                 )),
                             )
-                        })?)
+                        })
                     })?
                     .filter_map(|r| r.ok())
                     .collect();
@@ -708,4 +707,128 @@ fn row_to_item(row: &rusqlite::Row) -> Result<DbItem> {
         sync_state,
         pinned: row.get::<_, i32>(14).unwrap_or(0) != 0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_item(id: &str, path: &str) -> DbItem {
+        DbItem {
+            id: id.to_string(),
+            local_path: PathBuf::from(path),
+            name: Path::new(path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            parent_id: None,
+            etag: Some("etag1".into()),
+            ctag: None,
+            size: 42,
+            modified_at: None,
+            created_at: None,
+            sha1_hash: None,
+            quick_xor_hash: None,
+            is_folder: false,
+            is_placeholder: false,
+            sync_state: SyncState::Synced,
+            pinned: false,
+        }
+    }
+
+    fn open_temp_db() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("test.db")).unwrap();
+        (dir, db)
+    }
+
+    #[tokio::test]
+    async fn upsert_and_get_roundtrip() {
+        let (_dir, db) = open_temp_db();
+        let item = test_item("id1", "/sync/doc.txt");
+        db.upsert_item(&item).await.unwrap();
+
+        let by_id = db.get_item_by_id("id1").await.unwrap().unwrap();
+        assert_eq!(by_id.name, "doc.txt");
+        assert_eq!(by_id.size, 42);
+        assert_eq!(by_id.sync_state, SyncState::Synced);
+
+        let by_path = db
+            .get_item_by_path(Path::new("/sync/doc.txt"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_path.id, "id1");
+    }
+
+    #[tokio::test]
+    async fn upsert_replaces_stale_entry_at_same_path() {
+        let (_dir, db) = open_temp_db();
+        db.upsert_item(&test_item("old", "/sync/a.txt")).await.unwrap();
+        db.upsert_item(&test_item("new", "/sync/a.txt")).await.unwrap();
+
+        assert!(db.get_item_by_id("old").await.unwrap().is_none());
+        assert_eq!(
+            db.get_item_by_path(Path::new("/sync/a.txt"))
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "new"
+        );
+    }
+
+    #[tokio::test]
+    async fn delta_sync_never_overwrites_pinned() {
+        let (_dir, db) = open_temp_db();
+        db.upsert_item(&test_item("id1", "/sync/a.txt")).await.unwrap();
+        db.set_pinned("id1", true).await.unwrap();
+
+        // A later delta upsert (pinned defaults to false) must not clear the pin.
+        db.upsert_item(&test_item("id1", "/sync/a.txt")).await.unwrap();
+        assert!(db.get_item_by_id("id1").await.unwrap().unwrap().pinned);
+    }
+
+    #[tokio::test]
+    async fn set_sync_state_and_delete() {
+        let (_dir, db) = open_temp_db();
+        db.upsert_item(&test_item("id1", "/sync/a.txt")).await.unwrap();
+
+        db.set_sync_state("id1", &SyncState::CloudOnly).await.unwrap();
+        assert_eq!(
+            db.get_item_by_id("id1").await.unwrap().unwrap().sync_state,
+            SyncState::CloudOnly
+        );
+
+        db.delete_item("id1").await.unwrap();
+        assert!(db.get_item_by_id("id1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn delta_link_roundtrip() {
+        let (_dir, db) = open_temp_db();
+        assert!(db.get_delta_link("root").await.unwrap().is_none());
+        db.set_delta_link("root", "https://example/delta?token=1")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_delta_link("root").await.unwrap().unwrap(),
+            "https://example/delta?token=1"
+        );
+    }
+
+    #[tokio::test]
+    async fn symlink_roundtrip() {
+        let (_dir, db) = open_temp_db();
+        let parent = Path::new("/sync");
+        db.create_symlink(parent, "link", "/target").await.unwrap();
+        assert_eq!(
+            db.get_symlink(parent, "link").await.unwrap().unwrap(),
+            "/target"
+        );
+        assert_eq!(db.get_symlinks_in(parent).await.unwrap().len(), 1);
+        db.delete_symlink(parent, "link").await.unwrap();
+        assert!(db.get_symlink(parent, "link").await.unwrap().is_none());
+    }
 }

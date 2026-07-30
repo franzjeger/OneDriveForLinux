@@ -286,40 +286,35 @@ pub fn spawn_tray(
 
     // Tokio task: receive sync events and update tray state
     tokio::spawn(async move {
-        loop {
-            match event_rx.recv().await {
-                Ok(event) => {
-                    let mut st = state.lock();
-                    match event {
-                        SyncEvent::SyncStarted => {
-                            st.status = TrayStatus::Syncing;
-                        }
-                        SyncEvent::SyncCompleted => {
-                            if !matches!(st.status, TrayStatus::Paused) {
-                                st.status = TrayStatus::Idle;
-                            }
-                        }
-                        SyncEvent::ItemStateChanged { path, state: sync_state } => {
-                            st.push_recent(path, sync_state);
-                        }
-                        SyncEvent::Paused => {
-                            st.status = TrayStatus::Paused;
-                        }
-                        SyncEvent::Resumed => {
-                            st.status = TrayStatus::Idle;
-                        }
-                        SyncEvent::Error(msg) => {
-                            st.status = TrayStatus::Error(msg);
-                        }
-                        SyncEvent::AuthRequired => {
-                            st.status = TrayStatus::AuthRequired;
-                        }
-                    }
-                    drop(st);
-                    handle.update(|_| {});
+        while let Ok(event) = event_rx.recv().await {
+            let mut st = state.lock();
+            match event {
+                SyncEvent::SyncStarted => {
+                    st.status = TrayStatus::Syncing;
                 }
-                Err(_) => break, // channel closed / lagged
+                SyncEvent::SyncCompleted => {
+                    if !matches!(st.status, TrayStatus::Paused) {
+                        st.status = TrayStatus::Idle;
+                    }
+                }
+                SyncEvent::ItemStateChanged { path, state: sync_state } => {
+                    st.push_recent(path, sync_state);
+                }
+                SyncEvent::Paused => {
+                    st.status = TrayStatus::Paused;
+                }
+                SyncEvent::Resumed => {
+                    st.status = TrayStatus::Idle;
+                }
+                SyncEvent::Error(msg) => {
+                    st.status = TrayStatus::Error(msg);
+                }
+                SyncEvent::AuthRequired => {
+                    st.status = TrayStatus::AuthRequired;
+                }
             }
+            drop(st);
+            handle.update(|_| {});
         }
         info!("Tray event loop exiting");
     });

@@ -510,7 +510,17 @@ impl SyncEngine {
             warn!("Failed to send ItemStateChanged event: {e}");
         }
 
-        self.graph.download_file(&item.id, local_path).await?;
+        if let Err(e) = self.graph.download_file(&item.id, local_path).await {
+            // Reset the Syncing state so the item isn't stuck as "Syncing" forever.
+            if let Err(e2) = self
+                .db
+                .set_sync_state(&item.id, &SyncState::Error(e.to_string()))
+                .await
+            {
+                warn!("Failed to set Error state for {}: {e2}", item.id);
+            }
+            return Err(e.into());
+        }
 
         let db_item = self.drive_item_to_db(item, local_path, false);
         self.db.upsert_item(&db_item).await?;
@@ -710,6 +720,12 @@ impl SyncEngine {
             if seen_ids.contains(&db_item.id) {
                 continue;
             }
+            // Local-only items (created via FUSE, upload still pending) have
+            // never been on OneDrive, so they can never appear in a delta
+            // response — deleting them here would destroy unsynced user data.
+            if db_item.id.starts_with("_local_") {
+                continue;
+            }
             // Item no longer exists on OneDrive.
             if !db_item.is_placeholder {
                 info!("Reconcile: remote-deleted {:?}", db_item.local_path);
@@ -783,7 +799,7 @@ impl SyncEngine {
 
         // Spawn background downloads so the D-Bus call returns immediately.
         // Limit concurrency to avoid Graph API rate limiting.
-        let sem = Arc::new(Semaphore::new(4));
+        let sem = Arc::new(Semaphore::new(self.config.max_download_threads.max(1)));
         for db_item in to_download {
             let graph = Arc::clone(&self.graph);
             let db = Arc::clone(&self.db);
@@ -985,7 +1001,10 @@ impl SyncEngine {
         unsafe {
             let mut stat: libc::statvfs = std::mem::zeroed();
             if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
-                let free = stat.f_bavail as u64 * stat.f_bsize as u64;
+                // POSIX: capacity math uses the fragment size f_frsize;
+                // f_bsize is only the preferred I/O size.
+                let frsize = if stat.f_frsize > 0 { stat.f_frsize } else { stat.f_bsize };
+                let free = stat.f_bavail * frsize;
                 if free < Self::MIN_FREE_BYTES {
                     let free_mb = free / (1024 * 1024);
                     anyhow::bail!(
@@ -1064,26 +1083,30 @@ impl SyncEngine {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
-        for pattern in &self.config.excluded_patterns {
-            // Simple glob matching: only supports leading/trailing wildcards
-            if pattern.starts_with('*') && pattern.ends_with('*') {
-                let inner = &pattern[1..pattern.len() - 1];
-                if name.contains(inner) {
-                    return true;
-                }
-            } else if let Some(suffix) = pattern.strip_prefix('*') {
-                if name.ends_with(suffix) {
-                    return true;
-                }
-            } else if let Some(prefix) = pattern.strip_suffix('*') {
-                if name.starts_with(prefix) {
-                    return true;
-                }
-            } else if name == pattern.as_str() {
-                return true;
-            }
-        }
-        false
+        self.config
+            .excluded_patterns
+            .iter()
+            .any(|p| name_matches_pattern(name, p))
+    }
+}
+
+/// Simple glob matching: only supports leading/trailing wildcards.
+/// Case-insensitive, since OneDrive itself is case-insensitive and Windows
+/// artifacts vary in casing (e.g. `Thumbs.db` vs `thumbs.db`).
+fn name_matches_pattern(name: &str, pattern: &str) -> bool {
+    let name = name.to_lowercase();
+    let pattern = pattern.to_lowercase();
+    if let Some(inner) = pattern
+        .strip_prefix('*')
+        .and_then(|p| p.strip_suffix('*'))
+    {
+        name.contains(inner)
+    } else if let Some(suffix) = pattern.strip_prefix('*') {
+        name.ends_with(suffix)
+    } else if let Some(prefix) = pattern.strip_suffix('*') {
+        name.starts_with(prefix)
+    } else {
+        name == pattern
     }
 }
 
@@ -1094,5 +1117,46 @@ trait PathExt {
 impl PathExt for Path {
     fn file_extension_str(&self) -> Option<&str> {
         self.extension().and_then(|e| e.to_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::name_matches_pattern;
+
+    #[test]
+    fn exact_match() {
+        assert!(name_matches_pattern("desktop.ini", "desktop.ini"));
+        assert!(!name_matches_pattern("desktop.ini.bak", "desktop.ini"));
+    }
+
+    #[test]
+    fn suffix_wildcard() {
+        assert!(name_matches_pattern("notes.tmp", "*.tmp"));
+        assert!(!name_matches_pattern("notes.txt", "*.tmp"));
+    }
+
+    #[test]
+    fn prefix_wildcard() {
+        assert!(name_matches_pattern("~$report.docx", "~$*"));
+        assert!(name_matches_pattern(".~lock.file.odt", ".~lock.*"));
+        assert!(!name_matches_pattern("report.docx", "~$*"));
+    }
+
+    #[test]
+    fn contains_wildcard() {
+        assert!(name_matches_pattern("a.partial.download", "*partial*"));
+        assert!(!name_matches_pattern("complete.download", "*partial*"));
+    }
+
+    #[test]
+    fn case_insensitive() {
+        assert!(name_matches_pattern("Thumbs.db", "thumbs.db"));
+        assert!(name_matches_pattern("NOTES.TMP", "*.tmp"));
+    }
+
+    #[test]
+    fn bare_star_matches_everything() {
+        assert!(name_matches_pattern("anything", "*"));
     }
 }
