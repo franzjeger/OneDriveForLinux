@@ -19,6 +19,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 signal-hook = "0.3"
 signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
 dirs = "5"
-zbus = { version = "4", features = ["tokio"] }
+zbus = { version = "5", features = ["tokio"] }
 fuse3 = { version = "0.7", features = ["tokio-runtime", "unprivileged"] }
 futures = "0.3"
