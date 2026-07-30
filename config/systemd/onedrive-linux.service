@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.cargo/bin/onedrive-daemon
+ExecStart=%h/.local/bin/onedrive-daemon
 Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=info

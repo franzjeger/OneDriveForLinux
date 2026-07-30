@@ -6,6 +6,9 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 const TOKEN_ENDPOINT: &str = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token";
+/// OAuth scopes requested for both the device-code and refresh flows.
+const OAUTH_SCOPE: &str = "Files.ReadWrite.All offline_access User.Read";
+
 const DEVICE_CODE_ENDPOINT: &str =
     "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/devicecode";
 
@@ -139,7 +142,7 @@ impl AuthManager {
         let url = DEVICE_CODE_ENDPOINT.replace("{tenant}", &self.tenant_id);
         let params = [
             ("client_id", self.client_id.as_str()),
-            ("scope", "Files.ReadWrite.All offline_access User.Read"),
+            ("scope", OAUTH_SCOPE),
         ];
         let resp = self.http.post(&url).form(&params).send().await?;
         let status = resp.status();
@@ -269,7 +272,7 @@ impl AuthManager {
             ("client_id", self.client_id.as_str()),
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token.as_str()),
-            ("scope", "Files.ReadWrite.All offline_access User.Read"),
+            ("scope", OAUTH_SCOPE),
         ];
 
         let resp = self.http.post(&url).form(&params).send().await?;
