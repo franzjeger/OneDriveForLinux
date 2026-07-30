@@ -64,6 +64,10 @@ pub struct AuthManager {
     http: reqwest::Client,
     token: RwLock<Option<TokenSet>>,
     token_path: PathBuf,
+    /// Serializes token refreshes. Microsoft rotates refresh tokens, so two
+    /// concurrent refreshes with the same token can invalidate the grant and
+    /// force a full re-authentication.
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl AuthManager {
@@ -94,6 +98,7 @@ impl AuthManager {
             http,
             token: RwLock::new(token),
             token_path,
+            refresh_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -144,6 +149,11 @@ impl AuthManager {
             ),
         ];
         let resp = self.http.post(&url).form(&params).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Device code request failed ({status}): {body}");
+        }
         let dc: DeviceCodeResponse = resp.json().await?;
         Ok(dc)
     }
@@ -151,9 +161,19 @@ impl AuthManager {
     async fn poll_for_token(&self, dc: &DeviceCodeResponse) -> Result<TokenSet> {
         let url = TOKEN_ENDPOINT.replace("{tenant}", &self.tenant_id);
         let interval = std::time::Duration::from_secs(dc.interval.max(5));
+        // The device code itself expires — stop polling once it does instead
+        // of looping forever on an abandoned sign-in.
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(dc.expires_in);
 
         loop {
             tokio::time::sleep(interval).await;
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "Device code expired after {}s without sign-in — please try again",
+                    dc.expires_in
+                );
+            }
 
             let params = [
                 ("client_id", self.client_id.as_str()),
@@ -223,6 +243,28 @@ impl AuthManager {
     }
 
     async fn refresh_token_inner(&self) -> Result<String> {
+        // Snapshot the access token that prompted this refresh BEFORE queueing
+        // on the lock, so we can tell whether another task already refreshed.
+        let stale_token = {
+            let guard = self.token.read().await;
+            guard.as_ref().map(|ts| ts.access_token.clone())
+        };
+
+        let _guard = self.refresh_lock.lock().await;
+
+        // Another task may have refreshed while we waited for the lock. If the
+        // token changed, use it instead of spending our (single-use) refresh
+        // token again. Works for both the expiry path and the 401 force path:
+        // a 401'd token is by definition the stale one.
+        {
+            let guard = self.token.read().await;
+            if let Some(ts) = guard.as_ref() {
+                if Some(&ts.access_token) != stale_token.as_ref() {
+                    return Ok(ts.access_token.clone());
+                }
+            }
+        }
+
         let refresh_token = {
             let guard = self.token.read().await;
             guard
@@ -283,8 +325,9 @@ impl AuthManager {
 }
 
 fn dirs_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    PathBuf::from(home)
-        .join(".config")
+    // Must match the path odctl uses for sign-out (dirs::config_dir honors
+    // XDG_CONFIG_HOME; a hand-built $HOME/.config path does not).
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("/root/.config"))
         .join("onedrive-linux")
 }
