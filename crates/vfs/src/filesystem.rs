@@ -46,12 +46,18 @@ fn epoch_ts() -> Timestamp {
 #[derive(Clone)]
 struct InodeEntry {
     item_id: String,
+    /// Kernel lookup count — incremented each time the inode is handed to the
+    /// kernel, decremented by forget(). The entry is dropped at zero so the
+    /// inode table doesn't grow without bound over the daemon's lifetime.
+    lookups: u64,
 }
 
 /// In-memory symlink inode entry (local-only, not synced to OneDrive).
 #[derive(Clone)]
 struct SymlinkEntry {
     target: String,
+    /// Kernel lookup count — see [`InodeEntry::lookups`].
+    lookups: u64,
 }
 
 pub struct OneDriveFS {
@@ -141,14 +147,21 @@ impl OneDriveFS {
 
     async fn get_or_create_inode(&self, item_id: &str) -> u64 {
         {
-            let map = self.id_to_inode.read().await;
-            if let Some(&ino) = map.get(item_id) {
+            let existing = {
+                let map = self.id_to_inode.read().await;
+                map.get(item_id).copied()
+            };
+            if let Some(ino) = existing {
+                if let Some(entry) = self.inodes.write().await.get_mut(&ino) {
+                    entry.lookups += 1;
+                }
                 return ino;
             }
         }
         let ino = next_inode();
         let entry = InodeEntry {
             item_id: item_id.to_string(),
+            lookups: 1,
         };
         self.inodes.write().await.insert(ino, entry);
         self.id_to_inode
@@ -232,9 +245,15 @@ impl OneDriveFS {
     /// Register (or find) the inode for a local-only symlink under `parent`.
     async fn get_or_create_symlink_inode(&self, parent: u64, name: &str, target: &str) -> u64 {
         {
-            let lookup = self.symlink_lookup.read().await;
-            if let Some(&existing) = lookup.get(&(parent, name.to_string())) {
-                return existing;
+            let existing = {
+                let lookup = self.symlink_lookup.read().await;
+                lookup.get(&(parent, name.to_string())).copied()
+            };
+            if let Some(ino) = existing {
+                if let Some(entry) = self.symlink_inodes.write().await.get_mut(&ino) {
+                    entry.lookups += 1;
+                }
+                return ino;
             }
         }
         let ino = next_inode();
@@ -242,6 +261,7 @@ impl OneDriveFS {
             ino,
             SymlinkEntry {
                 target: target.to_string(),
+                lookups: 1,
             },
         );
         self.symlink_lookup
@@ -297,6 +317,41 @@ impl Filesystem for OneDriveFS {
         Ok(ReplyInit {
             max_write: std::num::NonZeroU32::new(128 * 1024).unwrap(),
         })
+    }
+
+    /// Kernel dropped `nlookup` references to this inode. When our count hits
+    /// zero the entry is evicted from the in-memory tables — without this, the
+    /// inode table grows without bound for the lifetime of the daemon.
+    async fn forget(&self, _req: Request, inode: u64, nlookup: u64) {
+        // Regular items.
+        {
+            let mut map = self.inodes.write().await;
+            if let Some(entry) = map.get_mut(&inode) {
+                entry.lookups = entry.lookups.saturating_sub(nlookup);
+                if entry.lookups == 0 {
+                    let item_id = entry.item_id.clone();
+                    map.remove(&inode);
+                    drop(map);
+                    self.id_to_inode.write().await.remove(&item_id);
+                    debug!("forget: evicted inode {inode} ({item_id})");
+                }
+                return;
+            }
+        }
+        // Local-only symlinks.
+        let mut map = self.symlink_inodes.write().await;
+        if let Some(entry) = map.get_mut(&inode) {
+            entry.lookups = entry.lookups.saturating_sub(nlookup);
+            if entry.lookups == 0 {
+                map.remove(&inode);
+                drop(map);
+                self.symlink_lookup
+                    .write()
+                    .await
+                    .retain(|_, &mut ino| ino != inode);
+                debug!("forget: evicted symlink inode {inode}");
+            }
+        }
     }
 
     async fn destroy(&self, _req: Request) {
