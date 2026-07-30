@@ -194,9 +194,8 @@ impl GraphClient {
         // Collect all pages into one response so callers get a complete batch.
         let mut all_items = Vec::new();
         let mut current_url = url;
-        let mut final_delta_link: Option<String> = None;
 
-        loop {
+        let final_delta_link = loop {
             let resp = self.request_with_retry(|| async {
                 let token = self.bearer().await?;
                 let resp = self
@@ -224,10 +223,9 @@ impl GraphClient {
             if let Some(next) = next_link {
                 current_url = next;
             } else {
-                final_delta_link = delta_link;
-                break;
+                break delta_link;
             }
-        }
+        };
 
         Ok(DeltaResponse {
             items: all_items,

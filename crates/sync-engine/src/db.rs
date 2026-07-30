@@ -282,13 +282,13 @@ impl Database {
             )?;
             let items: Result<Vec<DbItem>, _> = stmt
                 .query_map(params![parent_id], |row| {
-                    Ok(row_to_item(row).map_err(|e| {
+                    row_to_item(row).map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
                             0,
                             rusqlite::types::Type::Text,
-                            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+                            Box::new(std::io::Error::other(e.to_string())),
                         )
-                    })?)
+                    })
                 })?
                 .map(|r| r.map_err(anyhow::Error::from))
                 .collect();
@@ -328,13 +328,13 @@ impl Database {
             )?;
             let items: Result<Vec<DbItem>, _> = stmt
                 .query_map([], |row| {
-                    Ok(row_to_item(row).map_err(|e| {
+                    row_to_item(row).map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
                             0,
                             rusqlite::types::Type::Text,
-                            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+                            Box::new(std::io::Error::other(e.to_string())),
                         )
-                    })?)
+                    })
                 })?
                 .map(|r| r.map_err(anyhow::Error::from))
                 .collect();
@@ -422,13 +422,13 @@ impl Database {
             )?;
             let items: Result<Vec<DbItem>, _> = stmt
                 .query_map(params![glob], |row| {
-                    Ok(row_to_item(row).map_err(|e| {
+                    row_to_item(row).map_err(|e| {
                         rusqlite::Error::FromSqlConversionFailure(
                             0,
                             rusqlite::types::Type::Text,
-                            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())),
+                            Box::new(std::io::Error::other(e.to_string())),
                         )
-                    })?)
+                    })
                 })?
                 .map(|r| r.map_err(anyhow::Error::from))
                 .collect();
@@ -518,16 +518,15 @@ impl Database {
                 )?;
                 let items: Vec<DbItem> = stmt
                     .query_map(params![prefix, glob], |row| {
-                        Ok(row_to_item(row).map_err(|e| {
+                        row_to_item(row).map_err(|e| {
                             rusqlite::Error::FromSqlConversionFailure(
                                 0,
                                 rusqlite::types::Type::Text,
-                                Box::new(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
+                                Box::new(std::io::Error::other(
                                     e.to_string(),
                                 )),
                             )
-                        })?)
+                        })
                     })?
                     .filter_map(|r| r.ok())
                     .collect();

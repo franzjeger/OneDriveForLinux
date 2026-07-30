@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| std::path::PathBuf::from("/root"))
             .join("OneDrive");
         let _ = std::process::Command::new("fusermount3")
-            .args(["-uz", &sync_dir.to_string_lossy().to_string()])
+            .args(["-uz", sync_dir.to_string_lossy().as_ref()])
             .status();
     }));
 

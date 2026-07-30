@@ -263,6 +263,9 @@ impl AuthManager {
     async fn save_token(&self, ts: TokenSet) -> Result<()> {
         let json = serde_json::to_string_pretty(&ts)?;
         tokio::fs::write(&self.token_path, json).await?;
+        // Tokens grant full drive access — keep them readable by the owner only.
+        let perms = std::os::unix::fs::PermissionsExt::from_mode(0o600);
+        tokio::fs::set_permissions(&self.token_path, perms).await?;
         *self.token.write().await = Some(ts);
         debug!("Token saved to {:?}", self.token_path);
         Ok(())

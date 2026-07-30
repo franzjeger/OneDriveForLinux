@@ -985,7 +985,7 @@ impl SyncEngine {
         unsafe {
             let mut stat: libc::statvfs = std::mem::zeroed();
             if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
-                let free = stat.f_bavail as u64 * stat.f_bsize as u64;
+                let free = stat.f_bavail * stat.f_bsize;
                 if free < Self::MIN_FREE_BYTES {
                     let free_mb = free / (1024 * 1024);
                     anyhow::bail!(
