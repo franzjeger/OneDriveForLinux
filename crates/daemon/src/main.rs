@@ -19,21 +19,6 @@ async fn main() -> Result<()> {
         .with_target(true)
         .init();
 
-    // ── Panic hook — ensure FUSE is unmounted on crash ─────────────────────────
-    // Without this, a panic leaves a ghost FUSE mount that hangs any process
-    // (e.g. Dolphin) that tries to access the sync directory.
-    let default_panic = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        default_panic(info);
-        // Best-effort lazy unmount; ignore errors.
-        let sync_dir = dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("/root"))
-            .join("OneDrive");
-        let _ = std::process::Command::new("fusermount3")
-            .args(["-uz", sync_dir.to_string_lossy().as_ref()])
-            .status();
-    }));
-
     info!("OneDrive for Linux daemon starting");
 
     // ── Single-instance lock ───────────────────────────────────────────────────
@@ -74,6 +59,20 @@ async fn main() -> Result<()> {
     let config = Arc::new(config);
     info!("Sync directory: {:?}", config.sync_dir);
 
+    // ── Panic hook — ensure FUSE is unmounted on crash ─────────────────────────
+    // Without this, a panic leaves a ghost FUSE mount that hangs any process
+    // (e.g. Dolphin) that tries to access the sync directory. Installed after
+    // config load so it targets the *configured* sync_dir, not a guessed one.
+    let default_panic = std::panic::take_hook();
+    let panic_sync_dir = config.sync_dir.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        default_panic(info);
+        // Best-effort lazy unmount; ignore errors.
+        let _ = std::process::Command::new("fusermount3")
+            .args(["-uz", panic_sync_dir.to_string_lossy().as_ref()])
+            .status();
+    }));
+
     // Unmount any stale FUSE mount left by a previous unclean shutdown.
     if vfs::is_mounted(&config.sync_dir) {
         info!("Unmounting stale FUSE mount at {:?}", config.sync_dir);
@@ -105,16 +104,7 @@ async fn main() -> Result<()> {
     let graph = Arc::new(GraphClient::new(Arc::clone(&auth)));
 
     // ── Sync engine ────────────────────────────────────────────────────────────
-    let engine_cache_dir = if config.on_demand {
-        Some(
-            dirs::cache_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join("onedrive-linux")
-                .join("files"),
-        )
-    } else {
-        None
-    };
+    let engine_cache_dir = config.on_demand.then(cache_dir);
 
     let (engine, event_rx) = SyncEngine::new(
         Arc::clone(&config),
@@ -135,16 +125,11 @@ async fn main() -> Result<()> {
         let mountpoint = config.sync_dir.clone();
         vfs::prepare_mountpoint(&mountpoint).context("prepare mountpoint")?;
 
-        let cache_dir = dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("onedrive-linux")
-            .join("files");
-
         let fs = vfs::OneDriveFS::new(
             Arc::clone(&db),
             Arc::clone(&graph),
             mountpoint.clone(),
-            cache_dir,
+            cache_dir(),
         )
         .await
         .context("create FUSE filesystem")?;
@@ -198,8 +183,19 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Remove the PID file so a later instance with a recycled PID isn't
+    // mistaken for us still running.
+    let _ = std::fs::remove_file(&pid_path);
+
     info!("Daemon stopped");
     Ok(())
+}
+
+fn cache_dir() -> PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("onedrive-linux")
+        .join("files")
 }
 
 fn db_path() -> PathBuf {

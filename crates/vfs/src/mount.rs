@@ -12,32 +12,50 @@ pub fn prepare_mountpoint(path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    // Remove any real files/dirs that would block FUSE from mounting.
-    // (These can be left over if the daemon previously ran without on_demand mode.)
+    // Real files/dirs here block FUSE from mounting. They can be left over if
+    // the daemon previously ran without on_demand mode — in which case they are
+    // the user's synced files, possibly with local-only edits. Move them aside
+    // instead of deleting so nothing is ever lost.
     let entries: Vec<_> = std::fs::read_dir(path)
         .with_context(|| format!("read mountpoint {path:?}"))?
         .filter_map(|e| e.ok())
         .collect();
 
     if !entries.is_empty() {
+        let backup = backup_dir_for(path);
+        std::fs::create_dir_all(&backup)
+            .with_context(|| format!("create backup dir {backup:?}"))?;
         info!(
-            "Mountpoint {:?} has {} stale entries — clearing",
+            "Mountpoint {:?} has {} existing entries — moving them to {:?}",
             path,
-            entries.len()
+            entries.len(),
+            backup
         );
         for entry in entries {
-            let p = entry.path();
-            if p.is_dir() {
-                std::fs::remove_dir_all(&p)
-                    .with_context(|| format!("remove stale dir {p:?}"))?;
-            } else {
-                std::fs::remove_file(&p)
-                    .with_context(|| format!("remove stale file {p:?}"))?;
-            }
+            let src = entry.path();
+            let dest = backup.join(entry.file_name());
+            std::fs::rename(&src, &dest)
+                .with_context(|| format!("move {src:?} to {dest:?}"))?;
         }
     }
 
     Ok(())
+}
+
+/// Sibling directory the pre-FUSE contents are moved into, e.g.
+/// `~/OneDrive` → `~/OneDrive.pre-fuse-backup` (numbered if already present).
+fn backup_dir_for(path: &Path) -> std::path::PathBuf {
+    let base = path.with_extension("pre-fuse-backup");
+    if !base.exists() {
+        return base;
+    }
+    for i in 1.. {
+        let candidate = path.with_extension(format!("pre-fuse-backup.{i}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!()
 }
 
 /// Check whether a path is currently a FUSE mount.
