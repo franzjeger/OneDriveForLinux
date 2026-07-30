@@ -229,6 +229,49 @@ impl OneDriveFS {
         Some(item.local_path)
     }
 
+    /// Register (or find) the inode for a local-only symlink under `parent`.
+    async fn get_or_create_symlink_inode(&self, parent: u64, name: &str, target: &str) -> u64 {
+        {
+            let lookup = self.symlink_lookup.read().await;
+            if let Some(&existing) = lookup.get(&(parent, name.to_string())) {
+                return existing;
+            }
+        }
+        let ino = next_inode();
+        self.symlink_inodes.write().await.insert(
+            ino,
+            SymlinkEntry {
+                target: target.to_string(),
+            },
+        );
+        self.symlink_lookup
+            .write()
+            .await
+            .insert((parent, name.to_string()), ino);
+        ino
+    }
+
+    /// Resolve current attributes for any inode: root, regular item, or symlink.
+    async fn attr_for_inode(&self, inode: u64) -> Option<FileAttr> {
+        if inode == 1 {
+            return Some(self.root_attr());
+        }
+
+        let item_id = {
+            let map = self.inodes.read().await;
+            map.get(&inode).map(|e| e.item_id.clone())
+        };
+        if let Some(id) = item_id {
+            if let Ok(Some(item)) = self.db.get_item_by_id(&id).await {
+                return Some(self.db_item_to_attr(&item, inode));
+            }
+        }
+
+        let map = self.symlink_inodes.read().await;
+        map.get(&inode)
+            .map(|entry| self.symlink_attr(inode, entry.target.len() as u64))
+    }
+
     fn root_attr(&self) -> FileAttr {
         let now = sys_time_to_ts(SystemTime::now());
         FileAttr {
@@ -305,15 +348,9 @@ impl Filesystem for OneDriveFS {
         // Check DB for persisted symlinks not yet in memory (after daemon restart).
         if let Some(parent_path) = self.inode_to_path(parent).await {
             if let Ok(Some(target)) = self.db.get_symlink(&parent_path, &name_str).await {
-                let ino = next_inode();
-                let entry = SymlinkEntry {
-                    target: target.clone(),
-                };
-                self.symlink_inodes.write().await.insert(ino, entry);
-                self.symlink_lookup
-                    .write()
-                    .await
-                    .insert((parent, name_str.to_string()), ino);
+                let ino = self
+                    .get_or_create_symlink_inode(parent, &name_str, &target)
+                    .await;
                 let attr = self.symlink_attr(ino, target.len() as u64);
                 return Ok(ReplyEntry {
                     ttl: std::time::Duration::from_secs(TTL_SEC),
@@ -334,41 +371,13 @@ impl Filesystem for OneDriveFS {
         _flags: u32,
     ) -> FuseResult<ReplyAttr> {
         debug!("getattr inode={inode}");
-        if inode == 1 {
-            return Ok(ReplyAttr {
+        match self.attr_for_inode(inode).await {
+            Some(attr) => Ok(ReplyAttr {
                 ttl: std::time::Duration::from_secs(TTL_SEC),
-                attr: self.root_attr(),
-            });
+                attr,
+            }),
+            None => Err(libc::ENOENT.into()),
         }
-
-        let item_id = {
-            let map = self.inodes.read().await;
-            map.get(&inode).map(|e| e.item_id.clone())
-        };
-
-        if let Some(id) = item_id {
-            if let Ok(Some(item)) = self.db.get_item_by_id(&id).await {
-                let attr = self.db_item_to_attr(&item, inode);
-                return Ok(ReplyAttr {
-                    ttl: std::time::Duration::from_secs(TTL_SEC),
-                    attr,
-                });
-            }
-        }
-
-        // Check symlink inodes.
-        {
-            let map = self.symlink_inodes.read().await;
-            if let Some(entry) = map.get(&inode) {
-                let attr = self.symlink_attr(inode, entry.target.len() as u64);
-                return Ok(ReplyAttr {
-                    ttl: std::time::Duration::from_secs(TTL_SEC),
-                    attr,
-                });
-            }
-        }
-
-        Err(libc::ENOENT.into())
     }
 
     // setattr: accept time/mode/uid/gid changes silently — we do not persist
@@ -422,41 +431,13 @@ impl Filesystem for OneDriveFS {
         }
 
         // For everything else (times, mode, uid, gid) just return current attrs.
-        if inode == 1 {
-            return Ok(ReplyAttr {
+        match self.attr_for_inode(inode).await {
+            Some(attr) => Ok(ReplyAttr {
                 ttl: std::time::Duration::from_secs(TTL_SEC),
-                attr: self.root_attr(),
-            });
+                attr,
+            }),
+            None => Err(libc::ENOENT.into()),
         }
-
-        let item_id = {
-            let map = self.inodes.read().await;
-            map.get(&inode).map(|e| e.item_id.clone())
-        };
-
-        if let Some(id) = item_id {
-            if let Ok(Some(item)) = self.db.get_item_by_id(&id).await {
-                let attr = self.db_item_to_attr(&item, inode);
-                return Ok(ReplyAttr {
-                    ttl: std::time::Duration::from_secs(TTL_SEC),
-                    attr,
-                });
-            }
-        }
-
-        // Check symlink inodes.
-        {
-            let map = self.symlink_inodes.read().await;
-            if let Some(entry) = map.get(&inode) {
-                let attr = self.symlink_attr(inode, entry.target.len() as u64);
-                return Ok(ReplyAttr {
-                    ttl: std::time::Duration::from_secs(TTL_SEC),
-                    attr,
-                });
-            }
-        }
-
-        Err(libc::ENOENT.into())
     }
 
     type DirEntryStream<'a> = stream::Iter<std::vec::IntoIter<FuseResult<DirectoryEntry>>>
@@ -516,20 +497,9 @@ impl Filesystem for OneDriveFS {
         if let Some(parent_path) = self.inode_to_path(inode).await {
             if let Ok(symlinks) = self.db.get_symlinks_in(&parent_path).await {
                 for (name, target) in symlinks {
-                    let lookup = self.symlink_lookup.read().await;
-                    let ino = if let Some(&existing) = lookup.get(&(inode, name.clone())) {
-                        existing
-                    } else {
-                        drop(lookup);
-                        let new_ino = next_inode();
-                        let entry = SymlinkEntry { target };
-                        self.symlink_inodes.write().await.insert(new_ino, entry);
-                        self.symlink_lookup
-                            .write()
-                            .await
-                            .insert((inode, name.clone()), new_ino);
-                        new_ino
-                    };
+                    let ino = self
+                        .get_or_create_symlink_inode(inode, &name, &target)
+                        .await;
                     entries.push(Ok(DirectoryEntry {
                         inode: ino,
                         offset: entry_offset,
@@ -572,13 +542,18 @@ impl Filesystem for OneDriveFS {
         let mut entries: Vec<FuseResult<DirectoryEntryPlus>> = Vec::new();
         let ttl = std::time::Duration::from_secs(TTL_SEC);
 
+        // "." must carry THIS directory's attributes, not the root's.
+        let self_attr = self
+            .attr_for_inode(inode)
+            .await
+            .unwrap_or_else(|| self.root_attr());
         entries.push(Ok(DirectoryEntryPlus {
             inode,
             generation: 0,
             offset: 1,
             kind: FileType::Directory,
             name: std::ffi::OsString::from("."),
-            attr: self.root_attr(),
+            attr: self_attr,
             entry_ttl: ttl,
             attr_ttl: ttl,
         }));
@@ -621,22 +596,9 @@ impl Filesystem for OneDriveFS {
         if let Some(parent_path) = self.inode_to_path(inode).await {
             if let Ok(symlinks) = self.db.get_symlinks_in(&parent_path).await {
                 for (name, target) in symlinks {
-                    let lookup = self.symlink_lookup.read().await;
-                    let ino = if let Some(&existing) = lookup.get(&(inode, name.clone())) {
-                        existing
-                    } else {
-                        drop(lookup);
-                        let new_ino = next_inode();
-                        let entry = SymlinkEntry {
-                            target: target.clone(),
-                        };
-                        self.symlink_inodes.write().await.insert(new_ino, entry);
-                        self.symlink_lookup
-                            .write()
-                            .await
-                            .insert((inode, name.clone()), new_ino);
-                        new_ino
-                    };
+                    let ino = self
+                        .get_or_create_symlink_inode(inode, &name, &target)
+                        .await;
                     let sym_attr = self.symlink_attr(ino, target.len() as u64);
                     entries.push(Ok(DirectoryEntryPlus {
                         inode: ino,
@@ -863,12 +825,8 @@ impl Filesystem for OneDriveFS {
         let name_str = name.to_string_lossy().to_string();
         debug!("mkdir parent={parent} name={name_str}");
 
-        let parent_item_id = {
-            let map = self.inodes.read().await;
-            map.get(&parent).map(|e| e.item_id.clone())
-        };
-
-        let parent_id = match parent_item_id {
+        // Resolve from inode table / DB first; only hit the network as a last resort.
+        let parent_id = match self.drive_parent_id(parent).await {
             Some(id) => id,
             None => {
                 self.graph
@@ -984,6 +942,45 @@ impl Filesystem for OneDriveFS {
         }
 
         Err(libc::ENOENT.into())
+    }
+
+    async fn rmdir(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<()> {
+        let name_str = name.to_string_lossy();
+        debug!("rmdir parent={parent} name={name_str}");
+
+        let parent_drive_id = match self.drive_parent_id(parent).await {
+            Some(id) => id,
+            None => return Err(libc::ENOENT.into()),
+        };
+
+        let item = match self.db.get_child_by_name(&parent_drive_id, &name_str).await {
+            Ok(Some(item)) => item,
+            _ => return Err(libc::ENOENT.into()),
+        };
+        if !item.is_folder {
+            return Err(libc::ENOTDIR.into());
+        }
+
+        // POSIX: rmdir on a non-empty directory must fail with ENOTEMPTY.
+        match self.db.get_children(&item.id).await {
+            Ok(children) if !children.is_empty() => return Err(libc::ENOTEMPTY.into()),
+            Err(e) => {
+                error!("rmdir get_children: {e}");
+                return Err(libc::EIO.into());
+            }
+            _ => {}
+        }
+
+        if !item.id.starts_with("_local_") {
+            if let Err(e) = self.graph.delete_item(&item.id).await {
+                error!("Failed to delete remote folder {}: {e}", item.id);
+                return Err(libc::EIO.into());
+            }
+        }
+        if let Err(e) = self.db.delete_item(&item.id).await {
+            warn!("Failed to delete DB folder {}: {e}", item.id);
+        }
+        Ok(())
     }
 
     async fn rename(
@@ -1147,20 +1144,14 @@ impl Filesystem for OneDriveFS {
         let name_str = name.to_string_lossy().to_string();
         debug!("create parent={parent} name={name_str}");
 
-        let parent_id = {
-            let map = self.inodes.read().await;
-            match map.get(&parent).map(|e| e.item_id.clone()) {
-                Some(id) => id,
-                None => match self.drive_parent_id(parent).await {
-                    Some(id) => id,
-                    None => self
-                        .graph
-                        .get_drive_root()
-                        .await
-                        .map_err(|_| libc::EIO)?
-                        .id,
-                },
-            }
+        let parent_id = match self.drive_parent_id(parent).await {
+            Some(id) => id,
+            None => self
+                .graph
+                .get_drive_root()
+                .await
+                .map_err(|_| libc::EIO)?
+                .id,
         };
 
         // Build full local_path from parent's path.
@@ -1274,15 +1265,9 @@ impl Filesystem for OneDriveFS {
             })?;
 
         // Create inode for the symlink.
-        let ino = next_inode();
-        let entry = SymlinkEntry {
-            target: target.clone(),
-        };
-        self.symlink_inodes.write().await.insert(ino, entry);
-        self.symlink_lookup
-            .write()
-            .await
-            .insert((parent, name_str), ino);
+        let ino = self
+            .get_or_create_symlink_inode(parent, &name_str, &target)
+            .await;
 
         let attr = self.symlink_attr(ino, target.len() as u64);
         Ok(ReplyEntry {
