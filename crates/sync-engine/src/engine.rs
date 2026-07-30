@@ -510,7 +510,17 @@ impl SyncEngine {
             warn!("Failed to send ItemStateChanged event: {e}");
         }
 
-        self.graph.download_file(&item.id, local_path).await?;
+        if let Err(e) = self.graph.download_file(&item.id, local_path).await {
+            // Reset the Syncing state so the item isn't stuck as "Syncing" forever.
+            if let Err(e2) = self
+                .db
+                .set_sync_state(&item.id, &SyncState::Error(e.to_string()))
+                .await
+            {
+                warn!("Failed to set Error state for {}: {e2}", item.id);
+            }
+            return Err(e.into());
+        }
 
         let db_item = self.drive_item_to_db(item, local_path, false);
         self.db.upsert_item(&db_item).await?;
@@ -710,6 +720,12 @@ impl SyncEngine {
             if seen_ids.contains(&db_item.id) {
                 continue;
             }
+            // Local-only items (created via FUSE, upload still pending) have
+            // never been on OneDrive, so they can never appear in a delta
+            // response — deleting them here would destroy unsynced user data.
+            if db_item.id.starts_with("_local_") {
+                continue;
+            }
             // Item no longer exists on OneDrive.
             if !db_item.is_placeholder {
                 info!("Reconcile: remote-deleted {:?}", db_item.local_path);
@@ -783,7 +799,7 @@ impl SyncEngine {
 
         // Spawn background downloads so the D-Bus call returns immediately.
         // Limit concurrency to avoid Graph API rate limiting.
-        let sem = Arc::new(Semaphore::new(4));
+        let sem = Arc::new(Semaphore::new(self.config.max_download_threads.max(1)));
         for db_item in to_download {
             let graph = Arc::clone(&self.graph);
             let db = Arc::clone(&self.db);
@@ -985,7 +1001,10 @@ impl SyncEngine {
         unsafe {
             let mut stat: libc::statvfs = std::mem::zeroed();
             if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
-                let free = stat.f_bavail * stat.f_bsize;
+                // POSIX: capacity math uses the fragment size f_frsize;
+                // f_bsize is only the preferred I/O size.
+                let frsize = if stat.f_frsize > 0 { stat.f_frsize } else { stat.f_bsize };
+                let free = stat.f_bavail * frsize;
                 if free < Self::MIN_FREE_BYTES {
                     let free_mb = free / (1024 * 1024);
                     anyhow::bail!(
