@@ -329,6 +329,30 @@ impl SyncEngine {
             return Err(e.into());
         }
 
+        // Integrity check against the server-reported QuickXorHash. Warn-only
+        // for now: our implementation is validated by unit tests but not yet
+        // against Microsoft's reference in the field, so a mismatch is logged
+        // loudly rather than failing the download.
+        if let Some(expected) = item.quick_xor_hash() {
+            let expected = expected.to_string();
+            let path = local_path.to_path_buf();
+            match tokio::task::spawn_blocking(move || {
+                crate::quickxor::QuickXorHash::hash_file(&path)
+            })
+            .await
+            {
+                Ok(Ok(actual)) if actual != expected => {
+                    warn!(
+                        "QuickXorHash mismatch for {:?}: server={expected} local={actual} — file may be corrupt",
+                        local_path
+                    );
+                }
+                Ok(Ok(_)) => debug!("QuickXorHash verified for {:?}", local_path),
+                Ok(Err(e)) => warn!("QuickXorHash read failed for {:?}: {e}", local_path),
+                Err(e) => warn!("QuickXorHash task failed for {:?}: {e}", local_path),
+            }
+        }
+
         let db_item = self.drive_item_to_db(item, local_path, false);
         self.db.upsert_item(&db_item).await?;
 

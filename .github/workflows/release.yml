@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build release binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libdbus-1-dev pkg-config libfuse3-dev fuse3
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --workspace
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          DIST="onedrive-linux-${VERSION}-x86_64"
+          mkdir -p "$DIST"
+          cp target/release/onedrive-daemon target/release/odctl "$DIST/"
+          cp config/systemd/onedrive-linux.service deploy.sh README.md "$DIST/"
+          tar czf "$DIST.tar.gz" "$DIST"
+          sha256sum "$DIST.tar.gz" > "$DIST.tar.gz.sha256"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            onedrive-linux-*.tar.gz
+            onedrive-linux-*.tar.gz.sha256
+          generate_release_notes: true
