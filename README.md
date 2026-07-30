@@ -1,5 +1,7 @@
 # OneDrive for Linux
 
+[![CI](https://github.com/franzjeger/OneDriveForLinux/actions/workflows/ci.yml/badge.svg)](https://github.com/franzjeger/OneDriveForLinux/actions/workflows/ci.yml)
+
 A native OneDrive client for Linux featuring:
 
 - **Files On-Demand** via FUSE — files appear in your filesystem at full size but are only downloaded when accessed
@@ -71,12 +73,18 @@ EOF
 
 ```bash
 cd /path/to/OneDriveForLinux
-cargo build --release
 
-# Install binaries
-cp target/release/onedrive-daemon ~/.cargo/bin/
-cp target/release/odctl ~/.cargo/bin/
+# One-shot build + install + (re)start of the systemd service:
+./deploy.sh
+
+# Or manually:
+cargo build --release
+mkdir -p ~/.local/bin
+cp target/release/onedrive-daemon ~/.local/bin/
+cp target/release/odctl ~/.local/bin/
 ```
+
+> The systemd unit runs the daemon from `~/.local/bin` — make sure it is on your `PATH`.
 
 ---
 
@@ -145,14 +153,14 @@ on_demand = false
 
 ## Tray Icons
 
-The daemon communicates icon state via the StatusNotifier/AppIndicator D-Bus protocol. Name your icons in your theme's `icons/` directory:
+The daemon communicates icon state via the StatusNotifier/AppIndicator D-Bus protocol, using standard freedesktop icon names so any theme works out of the box:
 
-| Name | Meaning |
-|------|---------|
-| `onedrive-idle` | Up to date (cloud with checkmark) |
-| `onedrive-sync-0` … `onedrive-sync-3` | Syncing animation frames |
-| `onedrive-error` | Sync error (red X) |
-| `onedrive-paused` | Sync paused |
+| Icon name | Meaning |
+|-----------|---------|
+| `folder-cloud` | Up to date |
+| `emblem-synchronizing` | Syncing |
+| `dialog-error` | Sync error or sign-in required |
+| `media-playback-pause` | Sync paused |
 
 ---
 

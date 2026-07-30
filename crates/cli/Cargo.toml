@@ -9,10 +9,10 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-anyhow = "1"
+anyhow.workspace = true
 zbus = { version = "5", features = ["tokio"] }
-tokio = { version = "1", features = ["full"] }
+tokio.workspace = true
 tabled = "0.15"
 toml = "0.8"
-dirs = "5"
+dirs.workspace = true
 rusqlite = { version = "0.40", features = ["bundled"] }

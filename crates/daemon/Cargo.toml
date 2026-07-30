@@ -12,13 +12,13 @@ sync-engine = { path = "../sync-engine" }
 graph-client = { path = "../graph-client" }
 vfs = { path = "../vfs" }
 tray = { path = "../tray" }
-tokio = { version = "1", features = ["full"] }
-anyhow = "1"
-tracing = "0.1"
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 signal-hook = "0.3"
 signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
-dirs = "5"
+dirs.workspace = true
 zbus = { version = "5", features = ["tokio"] }
 fuse3 = { version = "0.7", features = ["tokio-runtime", "unprivileged"] }
-futures = "0.3"
+futures.workspace = true

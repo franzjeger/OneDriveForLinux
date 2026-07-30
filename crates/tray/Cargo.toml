@@ -6,8 +6,8 @@ edition = "2021"
 [dependencies]
 ksni = "0.2"
 sync-engine = { path = "../sync-engine" }
-tokio = { version = "1", features = ["full"] }
-anyhow = "1"
-tracing = "0.1"
-parking_lot = "0.12"
-libc = "0.2"
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+libc.workspace = true
