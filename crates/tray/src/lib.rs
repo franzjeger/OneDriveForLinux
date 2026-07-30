@@ -256,7 +256,12 @@ impl Tray for OneDriveTray {
                 label: "Quit".into(),
                 icon_name: "application-exit".into(),
                 activate: Box::new(|_| {
-                    std::process::exit(0);
+                    // Raise SIGTERM instead of exiting directly so the daemon's
+                    // signal handler runs its graceful shutdown (FUSE unmount,
+                    // PID-file cleanup). A bare exit() leaves a ghost mount.
+                    unsafe {
+                        libc::raise(libc::SIGTERM);
+                    }
                 }),
                 ..Default::default()
             }
