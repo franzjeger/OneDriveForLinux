@@ -7,7 +7,15 @@ use crate::{
 use chrono::Utc;
 use dashmap::DashMap;
 use graph_client::{AuthManager, DriveItem, GraphClient, GraphError};
-use std::{path::Path, path::PathBuf, sync::{Arc, atomic::{AtomicUsize, Ordering}}, time::Instant};
+use std::{
+    path::Path,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 use tokio::sync::{broadcast, Mutex as TokioMutex, RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 
@@ -82,7 +90,8 @@ impl SyncEngine {
                 let engine_clone = Arc::clone(&engine_remote);
                 let result = tokio::task::spawn(async move {
                     engine_clone.remote_watcher_loop().await;
-                }).await;
+                })
+                .await;
                 match result {
                     Ok(()) => {
                         warn!("Remote watcher exited normally — restarting in 5s");
@@ -102,9 +111,9 @@ impl SyncEngine {
             tokio::spawn(async move {
                 loop {
                     let engine_clone = Arc::clone(&engine_local);
-                    let result = tokio::task::spawn(async move {
-                        engine_clone.local_watcher_loop().await
-                    }).await;
+                    let result =
+                        tokio::task::spawn(async move { engine_clone.local_watcher_loop().await })
+                            .await;
                     match result {
                         Ok(Ok(())) => {
                             warn!("Local watcher exited normally — restarting in 5s");
@@ -161,7 +170,11 @@ impl SyncEngine {
     /// Polls for the token in the background and auto-resumes sync when done.
     pub async fn start_reauthenticate(self: Arc<Self>) -> anyhow::Result<(String, String, String)> {
         let dc = self.auth.start_device_code_flow().await?;
-        let info = (dc.message.clone(), dc.user_code.clone(), dc.verification_uri.clone());
+        let info = (
+            dc.message.clone(),
+            dc.user_code.clone(),
+            dc.verification_uri.clone(),
+        );
 
         let auth = Arc::clone(&self.auth);
         let engine = Arc::clone(&self);
@@ -173,7 +186,9 @@ impl SyncEngine {
                 }
                 Err(e) => {
                     error!("Re-authentication failed: {e}");
-                    let _ = engine.event_tx.send(SyncEvent::Error(format!("Re-auth failed: {e}")));
+                    let _ = engine
+                        .event_tx
+                        .send(SyncEvent::Error(format!("Re-auth failed: {e}")));
                 }
             }
         });
@@ -190,13 +205,20 @@ impl SyncEngine {
         let delta_link = self.db.get_delta_link(&folder_id).await?;
         let was_full_sync = delta_link.is_none();
 
-        info!("Delta sync: calling get_delta (delta_link={})", delta_link.is_some());
+        info!(
+            "Delta sync: calling get_delta (delta_link={})",
+            delta_link.is_some()
+        );
         let response = self
             .graph
             .get_delta(&folder_id, delta_link.as_deref())
             .await?;
 
-        info!("Delta sync: got {} items, delta_link={}", response.items.len(), response.delta_link.is_some());
+        info!(
+            "Delta sync: got {} items, delta_link={}",
+            response.items.len(),
+            response.delta_link.is_some()
+        );
 
         let had_items = !response.items.is_empty();
         let seen_ids = if had_items {
@@ -241,11 +263,8 @@ impl SyncEngine {
 
         loop {
             // Wait up to 100ms for an event, then check debounce.
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                watcher.events.recv(),
-            )
-            .await
+            match tokio::time::timeout(std::time::Duration::from_millis(100), watcher.events.recv())
+                .await
             {
                 Ok(Some(event)) => {
                     if self.is_paused().await {
@@ -289,13 +308,20 @@ impl SyncEngine {
             if item.is_deleted() {
                 // Flush pending batch before any mutation that reads the DB.
                 if !db_batch.is_empty() {
-                    if let Err(e) = self.db.upsert_items_batch(std::mem::take(&mut db_batch)).await {
+                    if let Err(e) = self
+                        .db
+                        .upsert_items_batch(std::mem::take(&mut db_batch))
+                        .await
+                    {
                         error!("Failed to flush DB batch before delete: {e}");
                     }
                 }
                 if let Ok(Some(db_item)) = self.db.get_item_by_id(&item.id).await {
                     info!("Remote delete: {:?}", db_item.local_path);
-                    if let Err(e) = self.remove_local(&db_item.local_path, db_item.is_folder).await {
+                    if let Err(e) = self
+                        .remove_local(&db_item.local_path, db_item.is_folder)
+                        .await
+                    {
                         warn!("Failed to remove local file {:?}: {e}", db_item.local_path);
                     }
                     if let Err(e) = self.db.delete_item(&item.id).await {
@@ -312,9 +338,10 @@ impl SyncEngine {
             // Items outside sync_folders need only a DB record — batch them.
             if !self.config.on_demand && !self.config.sync_folders.is_empty() {
                 if let Ok(local_path) = self.item_local_path(&item) {
-                    let in_sync_folder = self.config.sync_folders.iter().any(|folder| {
-                        local_path.starts_with(self.config.sync_dir.join(folder))
-                    });
+                    let in_sync_folder =
+                        self.config.sync_folders.iter().any(|folder| {
+                            local_path.starts_with(self.config.sync_dir.join(folder))
+                        });
                     if !in_sync_folder {
                         db_batch.push(self.drive_item_to_db(&item, &local_path, true));
                         continue;
@@ -325,7 +352,11 @@ impl SyncEngine {
             // Items in sync_folders (or on_demand mode) need real file I/O.
             // Flush the batch first so DB is consistent for reads inside sync_item.
             if !db_batch.is_empty() {
-                if let Err(e) = self.db.upsert_items_batch(std::mem::take(&mut db_batch)).await {
+                if let Err(e) = self
+                    .db
+                    .upsert_items_batch(std::mem::take(&mut db_batch))
+                    .await
+                {
                     error!("Failed to flush DB batch: {e}");
                 }
             }
@@ -333,10 +364,11 @@ impl SyncEngine {
                 Ok(_) => {}
                 Err(e) => {
                     error!("Failed to sync item {}: {e}", item.id);
-                    if let Err(e2) = self.db.set_sync_state(
-                        &item.id,
-                        &SyncState::Error(e.to_string()),
-                    ).await {
+                    if let Err(e2) = self
+                        .db
+                        .set_sync_state(&item.id, &SyncState::Error(e.to_string()))
+                        .await
+                    {
                         warn!("Failed to set error state for {}: {e2}", item.id);
                     }
                 }
@@ -375,9 +407,11 @@ impl SyncEngine {
         // in the DB as cloud-only so they appear in the FUSE mount but are never
         // written to disk. Only applies in non-on_demand mode.
         if !self.config.on_demand && !self.config.sync_folders.is_empty() {
-            let in_sync_folder = self.config.sync_folders.iter().any(|folder| {
-                local_path.starts_with(self.config.sync_dir.join(folder))
-            });
+            let in_sync_folder = self
+                .config
+                .sync_folders
+                .iter()
+                .any(|folder| local_path.starts_with(self.config.sync_dir.join(folder)));
             if !in_sync_folder {
                 // Record in DB but do not download.
                 let db_item = self.drive_item_to_db(item, &local_path, true);
@@ -410,7 +444,8 @@ impl SyncEngine {
             // If the etag matches what we have in the DB the remote hasn't changed
             // since our last sync — no conflict possible, skip the check entirely.
             let existing = self.db.get_item_by_id(&item.id).await?;
-            let etag_unchanged = existing.as_ref()
+            let etag_unchanged = existing
+                .as_ref()
                 .and_then(|e| e.etag.as_deref())
                 .zip(item.e_tag.as_deref())
                 .map(|(db_etag, remote_etag)| db_etag == remote_etag)
@@ -423,9 +458,7 @@ impl SyncEngine {
                     .ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                     .map(|d| d.as_secs());
-                let remote_mtime = item
-                    .last_modified_date_time
-                    .map(|d| d.timestamp() as u64);
+                let remote_mtime = item.last_modified_date_time.map(|d| d.timestamp() as u64);
 
                 if let (Some(lm), Some(rm)) = (local_mtime, remote_mtime) {
                     if lm > rm && existing.is_some() {
@@ -438,8 +471,14 @@ impl SyncEngine {
 
         if self.config.on_demand {
             // Check if this item is already pinned in the DB — if so, keep it local.
-            let is_pinned = self.db.get_item_by_id(&item.id).await
-                .ok().flatten().map(|i| i.pinned).unwrap_or(false);
+            let is_pinned = self
+                .db
+                .get_item_by_id(&item.id)
+                .await
+                .ok()
+                .flatten()
+                .map(|i| i.pinned)
+                .unwrap_or(false);
 
             if is_pinned {
                 // Ensure it's downloaded to cache.
@@ -474,7 +513,8 @@ impl SyncEngine {
             // Skip download if the file already exists locally and the remote
             // etag hasn't changed since we last synced it.
             let existing = self.db.get_item_by_id(&item.id).await?;
-            let etag_unchanged = existing.as_ref()
+            let etag_unchanged = existing
+                .as_ref()
                 .and_then(|e| e.etag.as_deref())
                 .zip(item.e_tag.as_deref())
                 .map(|(db_etag, remote_etag)| db_etag == remote_etag)
@@ -539,7 +579,13 @@ impl SyncEngine {
     /// Holds a per-item lock (if item exists in DB) to prevent concurrent operations.
     pub async fn upload_item(&self, path: &Path) -> anyhow::Result<()> {
         // Acquire per-item lock if this file is already tracked.
-        let existing_id = self.db.get_item_by_path(path).await.ok().flatten().map(|i| i.id);
+        let existing_id = self
+            .db
+            .get_item_by_path(path)
+            .await
+            .ok()
+            .flatten()
+            .map(|i| i.id);
         let _guard = if let Some(ref id) = existing_id {
             let lock = self.item_lock(id);
             Some(lock.lock_owned().await)
@@ -596,9 +642,7 @@ impl SyncEngine {
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("conflict");
-        let ext = local_path
-            .file_extension_str()
-            .unwrap_or_default();
+        let ext = local_path.file_extension_str().unwrap_or_default();
         let ts = Utc::now().format("%Y%m%d_%H%M%S");
         let conflict_name = if ext.is_empty() {
             format!("{stem}_conflict_{ts}")
@@ -637,9 +681,10 @@ impl SyncEngine {
                     info!("Local change detected: {:?}", path);
                     if let Err(e) = self.upload_item(path).await {
                         error!("Upload failed for {:?}: {e}", path);
-                        if let Err(e) = self.event_tx.send(SyncEvent::Error(format!(
-                            "Upload failed for {path:?}: {e}"
-                        ))) {
+                        if let Err(e) = self
+                            .event_tx
+                            .send(SyncEvent::Error(format!("Upload failed for {path:?}: {e}")))
+                        {
                             warn!("Failed to send Error event: {e}");
                         }
                     }
@@ -671,9 +716,7 @@ impl SyncEngine {
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| anyhow::anyhow!("invalid dir name"))?;
-        let parent_path = path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("no parent"))?;
+        let parent_path = path.parent().ok_or_else(|| anyhow::anyhow!("no parent"))?;
 
         let parent_id = if let Some(db_item) = self.db.get_item_by_path(parent_path).await? {
             db_item.id
@@ -729,8 +772,14 @@ impl SyncEngine {
             // Item no longer exists on OneDrive.
             if !db_item.is_placeholder {
                 info!("Reconcile: remote-deleted {:?}", db_item.local_path);
-                if let Err(e) = self.remove_local(&db_item.local_path, db_item.is_folder).await {
-                    warn!("Reconcile: failed to remove local {:?}: {e}", db_item.local_path);
+                if let Err(e) = self
+                    .remove_local(&db_item.local_path, db_item.is_folder)
+                    .await
+                {
+                    warn!(
+                        "Reconcile: failed to remove local {:?}: {e}",
+                        db_item.local_path
+                    );
                 }
             }
             if let Err(e) = self.db.delete_item(&db_item.id).await {
@@ -749,20 +798,30 @@ impl SyncEngine {
             anyhow::bail!("Path not found in OneDrive: {:?}", path);
         }
 
-        let cache_dir = self.cache_dir.clone()
+        let cache_dir = self
+            .cache_dir
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("on_demand mode not active"))?;
 
         // Collect files that need downloading: cloud-only or placeholder.
         let to_download: Vec<_> = {
             let item = self.db.get_item_by_path(path).await?;
             if item.as_ref().map(|i| i.is_folder).unwrap_or(false) {
-                self.db.get_files_under(path).await?
+                self.db
+                    .get_files_under(path)
+                    .await?
                     .into_iter()
-                    .filter(|i| i.is_placeholder || !matches!(i.sync_state, SyncState::Synced | SyncState::Pinned))
+                    .filter(|i| {
+                        i.is_placeholder
+                            || !matches!(i.sync_state, SyncState::Synced | SyncState::Pinned)
+                    })
                     .collect()
             } else {
                 item.into_iter()
-                    .filter(|i| i.is_placeholder || !matches!(i.sync_state, SyncState::Synced | SyncState::Pinned))
+                    .filter(|i| {
+                        i.is_placeholder
+                            || !matches!(i.sync_state, SyncState::Synced | SyncState::Pinned)
+                    })
                     .collect()
             }
         };
@@ -783,7 +842,11 @@ impl SyncEngine {
 
         // Mark every file as Syncing immediately so overlays update at once.
         for db_item in &to_download {
-            if let Err(e) = self.db.set_sync_state(&db_item.id, &SyncState::Syncing).await {
+            if let Err(e) = self
+                .db
+                .set_sync_state(&db_item.id, &SyncState::Syncing)
+                .await
+            {
                 warn!("Failed to set Syncing state for {}: {e}", db_item.id);
             }
             if let Err(e) = self.event_tx.send(SyncEvent::ItemStateChanged {
@@ -827,7 +890,10 @@ impl SyncEngine {
                         }
                         Err(e) => {
                             error!("Pin download failed for {id}: {e}");
-                            if let Err(e2) = db.set_sync_state(&id, &SyncState::Error(e.to_string())).await {
+                            if let Err(e2) = db
+                                .set_sync_state(&id, &SyncState::Error(e.to_string()))
+                                .await
+                            {
                                 warn!("Pin: failed to set Error state for {id}: {e2}");
                             }
                         }
@@ -866,7 +932,9 @@ impl SyncEngine {
             anyhow::bail!("Path not found in OneDrive: {:?}", path);
         }
 
-        let cache_dir = self.cache_dir.as_ref()
+        let cache_dir = self
+            .cache_dir
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("on_demand mode not active"))?;
 
         let to_free: Vec<_> = {
@@ -889,8 +957,15 @@ impl SyncEngine {
             if let Err(e) = self.db.set_placeholder(&db_item.id, true).await {
                 warn!("Unpin: failed to set placeholder for {}: {e}", db_item.id);
             }
-            if let Err(e) = self.db.set_sync_state(&db_item.id, &SyncState::CloudOnly).await {
-                warn!("Unpin: failed to set CloudOnly state for {}: {e}", db_item.id);
+            if let Err(e) = self
+                .db
+                .set_sync_state(&db_item.id, &SyncState::CloudOnly)
+                .await
+            {
+                warn!(
+                    "Unpin: failed to set CloudOnly state for {}: {e}",
+                    db_item.id
+                );
             }
             if let Err(e) = self.event_tx.send(SyncEvent::ItemStateChanged {
                 path: db_item.local_path,
@@ -1003,7 +1078,11 @@ impl SyncEngine {
             if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
                 // POSIX: capacity math uses the fragment size f_frsize;
                 // f_bsize is only the preferred I/O size.
-                let frsize = if stat.f_frsize > 0 { stat.f_frsize } else { stat.f_bsize };
+                let frsize = if stat.f_frsize > 0 {
+                    stat.f_frsize
+                } else {
+                    stat.f_bsize
+                };
                 let free = stat.f_bavail * frsize;
                 if free < Self::MIN_FREE_BYTES {
                     let free_mb = free / (1024 * 1024);
@@ -1050,15 +1129,17 @@ impl SyncEngine {
         Ok(self.config.sync_dir.join(&item.name))
     }
 
-    fn drive_item_to_db(&self, item: &DriveItem, local_path: &Path, is_placeholder: bool) -> DbItem {
+    fn drive_item_to_db(
+        &self,
+        item: &DriveItem,
+        local_path: &Path,
+        is_placeholder: bool,
+    ) -> DbItem {
         DbItem {
             id: item.id.clone(),
             local_path: local_path.to_path_buf(),
             name: item.name.clone(),
-            parent_id: item
-                .parent_reference
-                .as_ref()
-                .and_then(|r| r.id.clone()),
+            parent_id: item.parent_reference.as_ref().and_then(|r| r.id.clone()),
             etag: item.e_tag.clone(),
             ctag: item.c_tag.clone(),
             size: item.size.unwrap_or(0),
@@ -1079,10 +1160,7 @@ impl SyncEngine {
     }
 
     fn is_excluded(&self, path: &Path) -> bool {
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         self.config
             .excluded_patterns
             .iter()
@@ -1096,10 +1174,7 @@ impl SyncEngine {
 fn name_matches_pattern(name: &str, pattern: &str) -> bool {
     let name = name.to_lowercase();
     let pattern = pattern.to_lowercase();
-    if let Some(inner) = pattern
-        .strip_prefix('*')
-        .and_then(|p| p.strip_suffix('*'))
-    {
+    if let Some(inner) = pattern.strip_prefix('*').and_then(|p| p.strip_suffix('*')) {
         name.contains(inner)
     } else if let Some(suffix) = pattern.strip_prefix('*') {
         name.ends_with(suffix)
@@ -1158,5 +1233,180 @@ mod tests {
     #[test]
     fn bare_star_matches_everything() {
         assert!(name_matches_pattern("anything", "*"));
+    }
+}
+
+/// Integration tests for delta handling. These exercise the paths that never
+/// touch the network in on-demand mode: placeholder upserts, deletions, root
+/// and remote-item skipping, and reconciliation.
+#[cfg(test)]
+mod delta_tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn test_engine(sync_dir: PathBuf) -> SyncEngine {
+        let config = Arc::new(Config {
+            sync_dir,
+            client_id: "test-client".into(),
+            tenant_id: "common".into(),
+            excluded_patterns: vec![],
+            sync_folders: vec![],
+            on_demand: true,
+            max_upload_threads: 1,
+            max_download_threads: 1,
+            delta_poll_interval_secs: 30,
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open(&dir.path().join("test.db")).unwrap());
+        // Leak the tempdir so the DB file outlives this constructor.
+        std::mem::forget(dir);
+        let auth = Arc::new(AuthManager::new("test-client".into(), "common".into()).unwrap());
+        let graph = Arc::new(GraphClient::new(Arc::clone(&auth)));
+        let (engine, _rx) = SyncEngine::new(config, db, graph, auth, None);
+        engine
+    }
+
+    fn drive_item(json: serde_json::Value) -> DriveItem {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[tokio::test]
+    async fn new_remote_file_becomes_cloud_only_placeholder() {
+        let sync_dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(sync_dir.path().to_path_buf());
+
+        let item = drive_item(serde_json::json!({
+            "id": "item1",
+            "name": "doc.txt",
+            "eTag": "e1",
+            "size": 10,
+            "file": {},
+            "parentReference": {"id": "root-id", "path": "/drive/root:"}
+        }));
+        engine.handle_delta(vec![item]).await;
+
+        let db_item = engine.db.get_item_by_id("item1").await.unwrap().unwrap();
+        assert!(db_item.is_placeholder);
+        assert_eq!(db_item.sync_state, SyncState::CloudOnly);
+        assert_eq!(db_item.local_path, sync_dir.path().join("doc.txt"));
+    }
+
+    #[tokio::test]
+    async fn remote_delete_removes_db_entry() {
+        let sync_dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(sync_dir.path().to_path_buf());
+
+        let item = drive_item(serde_json::json!({
+            "id": "item1",
+            "name": "doc.txt",
+            "file": {},
+            "parentReference": {"id": "root-id", "path": "/drive/root:"}
+        }));
+        engine.handle_delta(vec![item]).await;
+        assert!(engine.db.get_item_by_id("item1").await.unwrap().is_some());
+
+        let deleted = drive_item(serde_json::json!({
+            "id": "item1",
+            "deleted": {}
+        }));
+        engine.handle_delta(vec![deleted]).await;
+        assert!(engine.db.get_item_by_id("item1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn root_and_remote_items_are_skipped() {
+        let sync_dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(sync_dir.path().to_path_buf());
+
+        let root = drive_item(serde_json::json!({
+            "id": "root-id",
+            "name": "root",
+            "folder": {},
+            "parentReference": {}
+        }));
+        let remote = drive_item(serde_json::json!({
+            "id": "remote1",
+            "name": "Teams Chat Files",
+            "remoteItem": {"id": "other-drive-item"}
+        }));
+        let seen = engine.handle_delta(vec![root, remote]).await;
+
+        // Both are counted as seen (so reconciliation won't delete them)...
+        assert!(seen.contains("root-id"));
+        assert!(seen.contains("remote1"));
+        // ...but neither gets a DB row.
+        assert!(engine.db.get_item_by_id("root-id").await.unwrap().is_none());
+        assert!(engine.db.get_item_by_id("remote1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn folder_delta_is_recorded() {
+        let sync_dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(sync_dir.path().to_path_buf());
+
+        let folder = drive_item(serde_json::json!({
+            "id": "folder1",
+            "name": "Projects",
+            "folder": {"childCount": 0},
+            "parentReference": {"id": "root-id", "path": "/drive/root:"}
+        }));
+        engine.handle_delta(vec![folder]).await;
+
+        let db_item = engine.db.get_item_by_id("folder1").await.unwrap().unwrap();
+        assert!(db_item.is_folder);
+        assert_eq!(db_item.sync_state, SyncState::Synced);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_spares_pending_local_items() {
+        let sync_dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(sync_dir.path().to_path_buf());
+
+        // A synced remote item that has vanished from the delta response...
+        let stale = DbItem {
+            id: "stale-remote".into(),
+            local_path: sync_dir.path().join("gone.txt"),
+            name: "gone.txt".into(),
+            parent_id: Some("root-id".into()),
+            etag: None,
+            ctag: None,
+            size: 1,
+            modified_at: None,
+            created_at: None,
+            sha1_hash: None,
+            quick_xor_hash: None,
+            is_folder: false,
+            is_placeholder: false,
+            sync_state: SyncState::Synced,
+            pinned: false,
+        };
+        // ...and a locally-created item whose upload is still pending.
+        let local_only = DbItem {
+            id: "_local_42".into(),
+            local_path: sync_dir.path().join("new.txt"),
+            name: "new.txt".into(),
+            sync_state: SyncState::Syncing,
+            ..stale.clone()
+        };
+        engine.db.upsert_item(&stale).await.unwrap();
+        engine.db.upsert_item(&local_only).await.unwrap();
+
+        engine
+            .reconcile_deleted_items(&std::collections::HashSet::new())
+            .await;
+
+        // The stale remote item is gone; the pending local item survives.
+        assert!(engine
+            .db
+            .get_item_by_id("stale-remote")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(engine
+            .db
+            .get_item_by_id("_local_42")
+            .await
+            .unwrap()
+            .is_some());
     }
 }

@@ -46,8 +46,7 @@ impl Database {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)
-            .with_context(|| format!("open database {path:?}"))?;
+        let conn = Connection::open(path).with_context(|| format!("open database {path:?}"))?;
         let db = Database {
             conn: Arc::new(Mutex::new(conn)),
         };
@@ -522,9 +521,7 @@ impl Database {
                             rusqlite::Error::FromSqlConversionFailure(
                                 0,
                                 rusqlite::types::Type::Text,
-                                Box::new(std::io::Error::other(
-                                    e.to_string(),
-                                )),
+                                Box::new(std::io::Error::other(e.to_string())),
                             )
                         })
                     })?
@@ -612,9 +609,8 @@ impl Database {
     pub async fn get_symlinks_in(&self, parent_path: &Path) -> Result<Vec<(String, String)>> {
         let parent_str = parent_path.to_string_lossy().to_string();
         self.with_conn(move |conn| {
-            let mut stmt = conn.prepare_cached(
-                "SELECT name, target FROM local_symlinks WHERE parent_path = ?1",
-            )?;
+            let mut stmt = conn
+                .prepare_cached("SELECT name, target FROM local_symlinks WHERE parent_path = ?1")?;
             let rows = stmt.query_map(params![parent_str], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?;
@@ -765,8 +761,12 @@ mod tests {
     #[tokio::test]
     async fn upsert_replaces_stale_entry_at_same_path() {
         let (_dir, db) = open_temp_db();
-        db.upsert_item(&test_item("old", "/sync/a.txt")).await.unwrap();
-        db.upsert_item(&test_item("new", "/sync/a.txt")).await.unwrap();
+        db.upsert_item(&test_item("old", "/sync/a.txt"))
+            .await
+            .unwrap();
+        db.upsert_item(&test_item("new", "/sync/a.txt"))
+            .await
+            .unwrap();
 
         assert!(db.get_item_by_id("old").await.unwrap().is_none());
         assert_eq!(
@@ -782,20 +782,28 @@ mod tests {
     #[tokio::test]
     async fn delta_sync_never_overwrites_pinned() {
         let (_dir, db) = open_temp_db();
-        db.upsert_item(&test_item("id1", "/sync/a.txt")).await.unwrap();
+        db.upsert_item(&test_item("id1", "/sync/a.txt"))
+            .await
+            .unwrap();
         db.set_pinned("id1", true).await.unwrap();
 
         // A later delta upsert (pinned defaults to false) must not clear the pin.
-        db.upsert_item(&test_item("id1", "/sync/a.txt")).await.unwrap();
+        db.upsert_item(&test_item("id1", "/sync/a.txt"))
+            .await
+            .unwrap();
         assert!(db.get_item_by_id("id1").await.unwrap().unwrap().pinned);
     }
 
     #[tokio::test]
     async fn set_sync_state_and_delete() {
         let (_dir, db) = open_temp_db();
-        db.upsert_item(&test_item("id1", "/sync/a.txt")).await.unwrap();
+        db.upsert_item(&test_item("id1", "/sync/a.txt"))
+            .await
+            .unwrap();
 
-        db.set_sync_state("id1", &SyncState::CloudOnly).await.unwrap();
+        db.set_sync_state("id1", &SyncState::CloudOnly)
+            .await
+            .unwrap();
         assert_eq!(
             db.get_item_by_id("id1").await.unwrap().unwrap().sync_state,
             SyncState::CloudOnly

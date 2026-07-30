@@ -68,10 +68,7 @@ impl std::fmt::Display for SyncState {
 #[derive(Debug, Clone)]
 pub enum SyncEvent {
     /// An item's sync state changed.
-    ItemStateChanged {
-        path: PathBuf,
-        state: SyncState,
-    },
+    ItemStateChanged { path: PathBuf, state: SyncState },
     /// Overall sync pass started.
     SyncStarted,
     /// Overall sync pass completed.

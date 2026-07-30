@@ -69,16 +69,13 @@ impl GraphClient {
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> GraphResult<T> {
-        let resp = self.request_with_retry(|| async {
-            let token = self.bearer().await?;
-            let resp = self
-                .http
-                .get(url)
-                .bearer_auth(&token)
-                .send()
-                .await?;
-            Ok(resp)
-        }).await?;
+        let resp = self
+            .request_with_retry(|| async {
+                let token = self.bearer().await?;
+                let resp = self.http.get(url).bearer_auth(&token).send().await?;
+                Ok(resp)
+            })
+            .await?;
         let val: T = resp.json().await?;
         Ok(val)
     }
@@ -125,7 +122,9 @@ impl GraphClient {
                                 .and_then(|v| v.parse::<u64>().ok())
                                 .unwrap_or(30);
                             if attempt > MAX_RETRIES {
-                                return Err(GraphError::RateLimited { retry_after_secs: retry_secs });
+                                return Err(GraphError::RateLimited {
+                                    retry_after_secs: retry_secs,
+                                });
                             }
                             warn!("Rate limited (429), retry {attempt}/{MAX_RETRIES} after {retry_secs}s");
                             tokio::time::sleep(std::time::Duration::from_secs(retry_secs)).await;
@@ -135,7 +134,11 @@ impl GraphClient {
                             if attempt > MAX_RETRIES {
                                 return Err(GraphError::Api {
                                     status,
-                                    message: resp.status().canonical_reason().unwrap_or("server error").into(),
+                                    message: resp
+                                        .status()
+                                        .canonical_reason()
+                                        .unwrap_or("server error")
+                                        .into(),
                                 });
                             }
                             let delay = RETRY_BASE_DELAY_SECS * 2u64.pow(attempt - 1);
@@ -226,16 +229,18 @@ impl GraphClient {
         let mut current_url = url;
 
         let final_delta_link = loop {
-            let resp = self.request_with_retry(|| async {
-                let token = self.bearer().await?;
-                let resp = self
-                    .http
-                    .get(&current_url)
-                    .bearer_auth(&token)
-                    .send()
-                    .await?;
-                Ok(resp)
-            }).await?;
+            let resp = self
+                .request_with_retry(|| async {
+                    let token = self.bearer().await?;
+                    let resp = self
+                        .http
+                        .get(&current_url)
+                        .bearer_auth(&token)
+                        .send()
+                        .await?;
+                    Ok(resp)
+                })
+                .await?;
 
             // Parse via serde_json::Value first so that individual items with
             // unexpected field types don't abort the whole page.
@@ -270,16 +275,13 @@ impl GraphClient {
         let url = format!("{GRAPH_BASE}/me/drive/items/{item_id}/content");
         debug!("download_file({item_id}) -> {dest:?}");
 
-        let resp = self.request_with_retry(|| async {
-            let token = self.bearer().await?;
-            let resp = self
-                .http
-                .get(&url)
-                .bearer_auth(&token)
-                .send()
-                .await?;
-            Ok(resp)
-        }).await?;
+        let resp = self
+            .request_with_retry(|| async {
+                let token = self.bearer().await?;
+                let resp = self.http.get(&url).bearer_auth(&token).send().await?;
+                Ok(resp)
+            })
+            .await?;
 
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -355,23 +357,25 @@ impl GraphClient {
         let data = tokio::fs::read(path).await?;
         let content_length = data.len();
 
-        let resp = self.request_with_retry(|| {
-            let data = data.clone();
-            let url = url.clone();
-            async move {
-                let token = self.bearer().await?;
-                let resp = self
-                    .http
-                    .put(&url)
-                    .bearer_auth(&token)
-                    .header("Content-Type", "application/octet-stream")
-                    .header("Content-Length", content_length.to_string())
-                    .body(data)
-                    .send()
-                    .await?;
-                Ok(resp)
-            }
-        }).await?;
+        let resp = self
+            .request_with_retry(|| {
+                let data = data.clone();
+                let url = url.clone();
+                async move {
+                    let token = self.bearer().await?;
+                    let resp = self
+                        .http
+                        .put(&url)
+                        .bearer_auth(&token)
+                        .header("Content-Type", "application/octet-stream")
+                        .header("Content-Length", content_length.to_string())
+                        .body(data)
+                        .send()
+                        .await?;
+                    Ok(resp)
+                }
+            })
+            .await?;
         let item: DriveItem = resp.json().await?;
         info!("Uploaded (small) {name} -> id={}", item.id);
         Ok(item)
@@ -394,17 +398,19 @@ impl GraphClient {
             },
         };
 
-        let resp = self.request_with_retry(|| async {
-            let token = self.bearer().await?;
-            let resp = self
-                .http
-                .post(&url)
-                .bearer_auth(&token)
-                .json(&body)
-                .send()
-                .await?;
-            Ok(resp)
-        }).await?;
+        let resp = self
+            .request_with_retry(|| async {
+                let token = self.bearer().await?;
+                let resp = self
+                    .http
+                    .post(&url)
+                    .bearer_auth(&token)
+                    .json(&body)
+                    .send()
+                    .await?;
+                Ok(resp)
+            })
+            .await?;
         let session: UploadSession = resp.json().await?;
         debug!("Upload session created: {}", session.upload_url);
         Ok(session)
@@ -509,11 +515,7 @@ impl GraphClient {
 
     // ── Folder / item operations ───────────────────────────────────────────────
 
-    pub async fn create_folder(
-        &self,
-        parent_id: &str,
-        name: &str,
-    ) -> GraphResult<DriveItem> {
+    pub async fn create_folder(&self, parent_id: &str, name: &str) -> GraphResult<DriveItem> {
         let url = format!("{GRAPH_BASE}/me/drive/items/{parent_id}/children");
         let body = CreateFolderRequest {
             name: name.to_string(),
@@ -521,17 +523,19 @@ impl GraphClient {
             conflict_behavior: "rename".into(),
         };
 
-        let resp = self.request_with_retry(|| async {
-            let token = self.bearer().await?;
-            let resp = self
-                .http
-                .post(&url)
-                .bearer_auth(&token)
-                .json(&body)
-                .send()
-                .await?;
-            Ok(resp)
-        }).await?;
+        let resp = self
+            .request_with_retry(|| async {
+                let token = self.bearer().await?;
+                let resp = self
+                    .http
+                    .post(&url)
+                    .bearer_auth(&token)
+                    .json(&body)
+                    .send()
+                    .await?;
+                Ok(resp)
+            })
+            .await?;
         let item: DriveItem = resp.json().await?;
         info!("Created folder '{name}' id={}", item.id);
         Ok(item)
@@ -539,16 +543,13 @@ impl GraphClient {
 
     pub async fn delete_item(&self, item_id: &str) -> GraphResult<()> {
         let url = format!("{GRAPH_BASE}/me/drive/items/{item_id}");
-        let resp = self.request_with_retry(|| async {
-            let token = self.bearer().await?;
-            let resp = self
-                .http
-                .delete(&url)
-                .bearer_auth(&token)
-                .send()
-                .await?;
-            Ok(resp)
-        }).await?;
+        let resp = self
+            .request_with_retry(|| async {
+                let token = self.bearer().await?;
+                let resp = self.http.delete(&url).bearer_auth(&token).send().await?;
+                Ok(resp)
+            })
+            .await?;
         // 204 = success for delete
         if resp.status().as_u16() == 204 || resp.status().is_success() {
             info!("Deleted item {item_id}");
@@ -575,17 +576,19 @@ impl GraphClient {
             name: new_name.to_string(),
         };
 
-        let resp = self.request_with_retry(|| async {
-            let token = self.bearer().await?;
-            let resp = self
-                .http
-                .patch(&url)
-                .bearer_auth(&token)
-                .json(&body)
-                .send()
-                .await?;
-            Ok(resp)
-        }).await?;
+        let resp = self
+            .request_with_retry(|| async {
+                let token = self.bearer().await?;
+                let resp = self
+                    .http
+                    .patch(&url)
+                    .bearer_auth(&token)
+                    .json(&body)
+                    .send()
+                    .await?;
+                Ok(resp)
+            })
+            .await?;
         let item: DriveItem = resp.json().await?;
         info!("Moved item {item_id} -> parent={new_parent_id} name={new_name}");
         Ok(item)

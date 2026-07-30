@@ -88,10 +88,9 @@ impl Config {
                  Please create it with at least `client_id = \"<your-azure-client-id>\"`"
             );
         }
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("read config {path:?}"))?;
-        let cfg: Config = toml::from_str(&raw)
-            .with_context(|| format!("parse config {path:?}"))?;
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read config {path:?}"))?;
+        let cfg: Config = toml::from_str(&raw).with_context(|| format!("parse config {path:?}"))?;
         Ok(cfg)
     }
 

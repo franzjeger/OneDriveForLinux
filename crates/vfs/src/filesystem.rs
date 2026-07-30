@@ -303,12 +303,7 @@ impl Filesystem for OneDriveFS {
         debug!("OneDriveFS: destroy");
     }
 
-    async fn lookup(
-        &self,
-        _req: Request,
-        parent: u64,
-        name: &OsStr,
-    ) -> FuseResult<ReplyEntry> {
+    async fn lookup(&self, _req: Request, parent: u64, name: &OsStr) -> FuseResult<ReplyEntry> {
         let name_str = name.to_string_lossy();
         debug!("lookup parent={parent} name={name_str}");
 
@@ -318,9 +313,7 @@ impl Filesystem for OneDriveFS {
         };
 
         if let Ok(Some(item)) = self.db.get_child_by_name(&parent_drive_id, &name_str).await {
-            let ino = self
-                .get_or_create_inode(&item.id)
-                .await;
+            let ino = self.get_or_create_inode(&item.id).await;
             let attr = self.db_item_to_attr(&item, ino);
             return Ok(ReplyEntry {
                 ttl: std::time::Duration::from_secs(TTL_SEC),
@@ -440,7 +433,8 @@ impl Filesystem for OneDriveFS {
         }
     }
 
-    type DirEntryStream<'a> = stream::Iter<std::vec::IntoIter<FuseResult<DirectoryEntry>>>
+    type DirEntryStream<'a>
+        = stream::Iter<std::vec::IntoIter<FuseResult<DirectoryEntry>>>
     where
         Self: 'a;
 
@@ -458,7 +452,11 @@ impl Filesystem for OneDriveFS {
             None => return Err(libc::ENOENT.into()),
         };
 
-        let children = self.db.get_children(&parent_drive_id).await.unwrap_or_default();
+        let children = self
+            .db
+            .get_children(&parent_drive_id)
+            .await
+            .unwrap_or_default();
         let mut entries: Vec<FuseResult<DirectoryEntry>> = Vec::new();
 
         entries.push(Ok(DirectoryEntry {
@@ -476,9 +474,7 @@ impl Filesystem for OneDriveFS {
 
         let mut entry_offset = 3i64;
         for item in &children {
-            let ino = self
-                .get_or_create_inode(&item.id)
-                .await;
+            let ino = self.get_or_create_inode(&item.id).await;
             let kind = if item.is_folder {
                 FileType::Directory
             } else {
@@ -519,7 +515,8 @@ impl Filesystem for OneDriveFS {
         })
     }
 
-    type DirEntryPlusStream<'a> = stream::Iter<std::vec::IntoIter<FuseResult<DirectoryEntryPlus>>>
+    type DirEntryPlusStream<'a>
+        = stream::Iter<std::vec::IntoIter<FuseResult<DirectoryEntryPlus>>>
     where
         Self: 'a;
 
@@ -538,7 +535,11 @@ impl Filesystem for OneDriveFS {
             None => return Err(libc::ENOENT.into()),
         };
 
-        let children = self.db.get_children(&parent_drive_id).await.unwrap_or_default();
+        let children = self
+            .db
+            .get_children(&parent_drive_id)
+            .await
+            .unwrap_or_default();
         let mut entries: Vec<FuseResult<DirectoryEntryPlus>> = Vec::new();
         let ttl = std::time::Duration::from_secs(TTL_SEC);
 
@@ -570,9 +571,7 @@ impl Filesystem for OneDriveFS {
 
         let mut entry_offset = 3i64;
         for item in &children {
-            let ino = self
-                .get_or_create_inode(&item.id)
-                .await;
+            let ino = self.get_or_create_inode(&item.id).await;
             let kind = if item.is_folder {
                 FileType::Directory
             } else {
@@ -676,8 +675,7 @@ impl Filesystem for OneDriveFS {
 
         // Open the cache file — read+write so the same handle works for both
         // read() and write() FUSE calls without storing file content in RAM.
-        let write_access = flags & libc::O_WRONLY as u32 != 0
-            || flags & libc::O_RDWR as u32 != 0;
+        let write_access = flags & libc::O_WRONLY as u32 != 0 || flags & libc::O_RDWR as u32 != 0;
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(write_access)
@@ -726,7 +724,10 @@ impl Filesystem for OneDriveFS {
         _write_flags: u32,
         _flags: u32,
     ) -> FuseResult<ReplyWrite> {
-        debug!("write inode={inode} fh={fh} offset={offset} len={}", data.len());
+        debug!(
+            "write inode={inode} fh={fh} offset={offset} len={}",
+            data.len()
+        );
 
         // pwrite directly into the open cache file — no in-memory copy.
         {
@@ -776,16 +777,18 @@ impl Filesystem for OneDriveFS {
                             match graph.upload_file(&parent_id, &item.name, &cache_path).await {
                                 Ok(updated) => {
                                     let new_size = updated.size.unwrap_or_else(|| {
-                                        std::fs::metadata(&cache_path)
-                                            .map(|m| m.len())
-                                            .unwrap_or(0)
+                                        std::fs::metadata(&cache_path).map(|m| m.len()).unwrap_or(0)
                                     });
                                     // Re-read from DB to get current name/local_path — a
                                     // concurrent rename() may have changed them while we
                                     // were uploading. Without this, we'd overwrite the
                                     // renamed entry with the stale pre-rename name.
-                                    let current = db.get_item_by_id(&item.id).await
-                                        .ok().flatten().unwrap_or(item);
+                                    let current = db
+                                        .get_item_by_id(&item.id)
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or(item);
                                     let mut updated_item = current;
                                     updated_item.size = new_size;
                                     updated_item.etag = updated.e_tag;
@@ -850,7 +853,9 @@ impl Filesystem for OneDriveFS {
             })?;
 
         // Build full local_path from parent's path, not just sync_dir + name.
-        let parent_path = self.inode_to_path(parent).await
+        let parent_path = self
+            .inode_to_path(parent)
+            .await
             .unwrap_or_else(|| self.sync_dir.clone());
         let local_path = parent_path.join(&name_str);
         let db_item = sync_engine::DbItem {
@@ -1004,13 +1009,23 @@ impl Filesystem for OneDriveFS {
             None => return Err(libc::ENOENT.into()),
         };
 
-        if let Ok(Some(item)) = self.db.get_child_by_name(&old_parent_drive_id, &old_name).await {
-            let new_parent_path = self.inode_to_path(parent).await
+        if let Ok(Some(item)) = self
+            .db
+            .get_child_by_name(&old_parent_drive_id, &old_name)
+            .await
+        {
+            let new_parent_path = self
+                .inode_to_path(parent)
+                .await
                 .unwrap_or_else(|| self.sync_dir.clone());
             let new_local_path = new_parent_path.join(new_name.as_ref());
 
             // If destination already exists, remove it first (POSIX rename semantics).
-            if let Ok(Some(dest_item)) = self.db.get_child_by_name(&new_parent_drive_id, &new_name).await {
+            if let Ok(Some(dest_item)) = self
+                .db
+                .get_child_by_name(&new_parent_drive_id, &new_name)
+                .await
+            {
                 if !dest_item.id.starts_with("_local_") {
                     let _ = self.graph.delete_item(&dest_item.id).await;
                 }
@@ -1146,16 +1161,13 @@ impl Filesystem for OneDriveFS {
 
         let parent_id = match self.drive_parent_id(parent).await {
             Some(id) => id,
-            None => self
-                .graph
-                .get_drive_root()
-                .await
-                .map_err(|_| libc::EIO)?
-                .id,
+            None => self.graph.get_drive_root().await.map_err(|_| libc::EIO)?.id,
         };
 
         // Build full local_path from parent's path.
-        let parent_path = self.inode_to_path(parent).await
+        let parent_path = self
+            .inode_to_path(parent)
+            .await
             .unwrap_or_else(|| self.sync_dir.clone());
         let local_path = parent_path.join(&name_str);
 

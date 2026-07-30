@@ -118,7 +118,9 @@ async fn make_proxy(conn: &Connection) -> Result<OneDriveControlProxy<'_>> {
 }
 
 async fn cmd_status() -> Result<()> {
-    let conn = Connection::session().await.context("connect to D-Bus session bus")?;
+    let conn = Connection::session()
+        .await
+        .context("connect to D-Bus session bus")?;
     let proxy = make_proxy(&conn).await?;
 
     let items = proxy.get_status().await.context("get_status D-Bus call")?;
@@ -180,7 +182,10 @@ async fn cmd_sync(path: Option<String>) -> Result<()> {
         }
     };
 
-    proxy.force_sync(target.clone()).await.context("force_sync D-Bus call")?;
+    proxy
+        .force_sync(target.clone())
+        .await
+        .context("force_sync D-Bus call")?;
     println!("Force sync requested for: {target}");
     Ok(())
 }
@@ -193,7 +198,10 @@ async fn cmd_pin(paths: Vec<String>) -> Result<()> {
             .unwrap_or_else(|_| std::path::PathBuf::from(&path))
             .to_string_lossy()
             .to_string();
-        proxy.pin_item(abs.clone()).await.context("pin_item D-Bus call")?;
+        proxy
+            .pin_item(abs.clone())
+            .await
+            .context("pin_item D-Bus call")?;
         println!("Pinning: {abs} (downloading in background)");
     }
     Ok(())
@@ -207,7 +215,10 @@ async fn cmd_unpin(paths: Vec<String>) -> Result<()> {
             .unwrap_or_else(|_| std::path::PathBuf::from(&path))
             .to_string_lossy()
             .to_string();
-        proxy.unpin_item(abs.clone()).await.context("unpin_item D-Bus call")?;
+        proxy
+            .unpin_item(abs.clone())
+            .await
+            .context("unpin_item D-Bus call")?;
         println!("Unpinned: {abs} (freed from device)");
     }
     Ok(())
@@ -217,13 +228,10 @@ fn cmd_config() -> Result<()> {
     let cfg_path = config_path();
     if !cfg_path.exists() {
         eprintln!("Config file not found at {cfg_path:?}");
-        eprintln!(
-            "\nCreate it with at minimum:\n  client_id = \"<your-azure-app-client-id>\"\n"
-        );
+        eprintln!("\nCreate it with at minimum:\n  client_id = \"<your-azure-app-client-id>\"\n");
         return Ok(());
     }
-    let raw = std::fs::read_to_string(&cfg_path)
-        .with_context(|| format!("read {cfg_path:?}"))?;
+    let raw = std::fs::read_to_string(&cfg_path).with_context(|| format!("read {cfg_path:?}"))?;
     println!("# Config: {cfg_path:?}\n\n{raw}");
     Ok(())
 }
@@ -300,16 +308,31 @@ async fn cmd_pin_status(path_filter: Option<String>) -> Result<()> {
 
     let mut stmt = conn.prepare(query)?;
     let rows: Vec<(String, String, String, i64, bool)> = if let Some(ref p) = path_filter {
-        let abs = std::fs::canonicalize(p)
-            .unwrap_or_else(|_| std::path::PathBuf::from(p));
+        let abs = std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
         let like = format!("{}%", abs.to_string_lossy());
         stmt.query_map(rusqlite::params![like], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get::<_, i32>(4)? != 0))
-        })?.filter_map(|r| r.ok()).collect()
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get::<_, i32>(4)? != 0,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect()
     } else {
         stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get::<_, i32>(4)? != 0))
-        })?.filter_map(|r| r.ok()).collect()
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get::<_, i32>(4)? != 0,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect()
     };
 
     if rows.is_empty() {
@@ -337,7 +360,10 @@ async fn cmd_pin_status(path_filter: Option<String>) -> Result<()> {
 
     let total = rows.len() as u64;
     println!("Pinned files: {total}");
-    println!("On device:    {on_device}/{total} ({:.0}%)", on_device as f64 / total as f64 * 100.0);
+    println!(
+        "On device:    {on_device}/{total} ({:.0}%)",
+        on_device as f64 / total as f64 * 100.0
+    );
     println!("Missing:      {missing}");
     println!("Cached size:  {}", format_bytes(cached_bytes));
     println!("Expected:     {}", format_bytes(total_bytes));
