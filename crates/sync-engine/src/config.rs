@@ -128,3 +128,42 @@ pub fn config_path() -> PathBuf {
         .join("onedrive-linux")
         .join("config.toml")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn minimal_config_gets_defaults() {
+        let cfg: Config = toml::from_str(r#"client_id = "abc-123""#).unwrap();
+        assert_eq!(cfg.client_id, "abc-123");
+        assert_eq!(cfg.tenant_id, "common");
+        assert!(cfg.on_demand);
+        assert_eq!(cfg.max_upload_threads, 4);
+        assert_eq!(cfg.max_download_threads, 4);
+        assert_eq!(cfg.delta_poll_interval_secs, 30);
+        assert!(cfg.excluded_patterns.contains(&"*.tmp".to_string()));
+        assert!(cfg.sync_folders.is_empty());
+    }
+
+    #[test]
+    fn missing_client_id_is_an_error() {
+        assert!(toml::from_str::<Config>("on_demand = false").is_err());
+    }
+
+    #[test]
+    fn explicit_values_override_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"
+            client_id = "abc"
+            tenant_id = "my-tenant"
+            on_demand = false
+            delta_poll_interval_secs = 5
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.tenant_id, "my-tenant");
+        assert!(!cfg.on_demand);
+        assert_eq!(cfg.delta_poll_interval_secs, 5);
+    }
+}

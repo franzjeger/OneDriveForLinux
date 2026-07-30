@@ -1064,26 +1064,30 @@ impl SyncEngine {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
-        for pattern in &self.config.excluded_patterns {
-            // Simple glob matching: only supports leading/trailing wildcards
-            if pattern.starts_with('*') && pattern.ends_with('*') {
-                let inner = &pattern[1..pattern.len() - 1];
-                if name.contains(inner) {
-                    return true;
-                }
-            } else if let Some(suffix) = pattern.strip_prefix('*') {
-                if name.ends_with(suffix) {
-                    return true;
-                }
-            } else if let Some(prefix) = pattern.strip_suffix('*') {
-                if name.starts_with(prefix) {
-                    return true;
-                }
-            } else if name == pattern.as_str() {
-                return true;
-            }
-        }
-        false
+        self.config
+            .excluded_patterns
+            .iter()
+            .any(|p| name_matches_pattern(name, p))
+    }
+}
+
+/// Simple glob matching: only supports leading/trailing wildcards.
+/// Case-insensitive, since OneDrive itself is case-insensitive and Windows
+/// artifacts vary in casing (e.g. `Thumbs.db` vs `thumbs.db`).
+fn name_matches_pattern(name: &str, pattern: &str) -> bool {
+    let name = name.to_lowercase();
+    let pattern = pattern.to_lowercase();
+    if let Some(inner) = pattern
+        .strip_prefix('*')
+        .and_then(|p| p.strip_suffix('*'))
+    {
+        name.contains(inner)
+    } else if let Some(suffix) = pattern.strip_prefix('*') {
+        name.ends_with(suffix)
+    } else if let Some(prefix) = pattern.strip_suffix('*') {
+        name.starts_with(prefix)
+    } else {
+        name == pattern
     }
 }
 
@@ -1094,5 +1098,46 @@ trait PathExt {
 impl PathExt for Path {
     fn file_extension_str(&self) -> Option<&str> {
         self.extension().and_then(|e| e.to_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::name_matches_pattern;
+
+    #[test]
+    fn exact_match() {
+        assert!(name_matches_pattern("desktop.ini", "desktop.ini"));
+        assert!(!name_matches_pattern("desktop.ini.bak", "desktop.ini"));
+    }
+
+    #[test]
+    fn suffix_wildcard() {
+        assert!(name_matches_pattern("notes.tmp", "*.tmp"));
+        assert!(!name_matches_pattern("notes.txt", "*.tmp"));
+    }
+
+    #[test]
+    fn prefix_wildcard() {
+        assert!(name_matches_pattern("~$report.docx", "~$*"));
+        assert!(name_matches_pattern(".~lock.file.odt", ".~lock.*"));
+        assert!(!name_matches_pattern("report.docx", "~$*"));
+    }
+
+    #[test]
+    fn contains_wildcard() {
+        assert!(name_matches_pattern("a.partial.download", "*partial*"));
+        assert!(!name_matches_pattern("complete.download", "*partial*"));
+    }
+
+    #[test]
+    fn case_insensitive() {
+        assert!(name_matches_pattern("Thumbs.db", "thumbs.db"));
+        assert!(name_matches_pattern("NOTES.TMP", "*.tmp"));
+    }
+
+    #[test]
+    fn bare_star_matches_everything() {
+        assert!(name_matches_pattern("anything", "*"));
     }
 }
