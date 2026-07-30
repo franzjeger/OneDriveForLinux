@@ -137,3 +137,87 @@ impl Default for EventDebouncer {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind};
+
+    fn event(kind: EventKind, path: &str) -> Event {
+        Event::new(kind).add_path(PathBuf::from(path))
+    }
+
+    #[test]
+    fn burst_on_same_path_coalesces_to_first_kind() {
+        let mut d = EventDebouncer::new();
+        let create = event(EventKind::Create(CreateKind::File), "/a.txt");
+        let modify = event(EventKind::Modify(ModifyKind::Any), "/a.txt");
+
+        assert!(d.feed(create).is_empty());
+        assert!(d.feed(modify).is_empty());
+
+        // After the debounce window, exactly one event drains — the first kind.
+        let later = Instant::now() + Duration::from_millis(DEBOUNCE_MS + 1);
+        let ready = d.drain_ready(later);
+        assert_eq!(ready.len(), 1);
+        assert!(matches!(ready[0].kind, EventKind::Create(_)));
+    }
+
+    #[test]
+    fn events_within_window_are_held() {
+        let mut d = EventDebouncer::new();
+        let ready = d.feed(event(EventKind::Create(CreateKind::File), "/a.txt"));
+        assert!(ready.is_empty());
+        // Draining immediately returns nothing — the window hasn't passed.
+        assert!(d.drain_ready(Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn distinct_paths_drain_independently() {
+        let mut d = EventDebouncer::new();
+        d.feed(event(EventKind::Create(CreateKind::File), "/a.txt"));
+        d.feed(event(EventKind::Create(CreateKind::File), "/b.txt"));
+        let later = Instant::now() + Duration::from_millis(DEBOUNCE_MS + 1);
+        assert_eq!(d.drain_ready(later).len(), 2);
+    }
+
+    #[test]
+    fn flush_returns_everything_regardless_of_window() {
+        let mut d = EventDebouncer::new();
+        d.feed(event(EventKind::Create(CreateKind::File), "/a.txt"));
+        assert_eq!(d.flush().len(), 1);
+        assert!(d.flush().is_empty());
+    }
+
+    #[test]
+    fn kind_classification() {
+        assert!(EventDebouncer::is_create_or_modify(&EventKind::Create(
+            CreateKind::File
+        )));
+        assert!(EventDebouncer::is_create_or_modify(&EventKind::Modify(
+            ModifyKind::Any
+        )));
+        assert!(!EventDebouncer::is_create_or_modify(&EventKind::Remove(
+            RemoveKind::File
+        )));
+        assert!(EventDebouncer::is_remove(&EventKind::Remove(
+            RemoveKind::File
+        )));
+    }
+
+    #[test]
+    fn rename_from_ignored_name_is_not_dropped() {
+        // notify coalesces MOVED_FROM+MOVED_TO into one event with both paths.
+        // Only ignore when ALL paths are ignorable, else "x.tmp -> doc.docx"
+        // renames would be silently lost.
+        let both = Event::new(EventKind::Modify(ModifyKind::Any))
+            .add_path(PathBuf::from("/dir/x.tmp"))
+            .add_path(PathBuf::from("/dir/doc.docx"));
+        assert!(!should_ignore_event(&both));
+
+        let all_ignored = Event::new(EventKind::Modify(ModifyKind::Any))
+            .add_path(PathBuf::from("/dir/x.tmp"))
+            .add_path(PathBuf::from("/dir/~$lock.docx"));
+        assert!(should_ignore_event(&all_ignored));
+    }
+}
