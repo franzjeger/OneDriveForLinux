@@ -15,4 +15,4 @@ tokio = { version = "1", features = ["full"] }
 tabled = "0.15"
 toml = "0.8"
 dirs = "5"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
