@@ -186,3 +186,86 @@ pub struct MoveItemRequest {
 pub struct MoveParentReference {
     pub id: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_regular_file_item() {
+        let item: DriveItem = serde_json::from_value(serde_json::json!({
+            "id": "item1",
+            "name": "doc.txt",
+            "eTag": "e1",
+            "size": 42,
+            "file": {"mimeType": "text/plain", "hashes": {"sha1Hash": "abc"}},
+            "parentReference": {"id": "parent1", "path": "/drive/root:/Docs"}
+        }))
+        .unwrap();
+        assert!(item.is_file());
+        assert!(!item.is_folder());
+        assert!(!item.is_deleted());
+        assert!(!item.is_root());
+        assert_eq!(item.sha1_hash(), Some("abc"));
+        assert_eq!(item.size, Some(42));
+    }
+
+    #[test]
+    fn parses_deleted_item_without_name() {
+        // Delta responses omit `name` for deleted items — must not fail to parse.
+        let item: DriveItem = serde_json::from_value(serde_json::json!({
+            "id": "gone1",
+            "deleted": {"state": "deleted"}
+        }))
+        .unwrap();
+        assert!(item.is_deleted());
+        assert_eq!(item.name, "");
+    }
+
+    #[test]
+    fn root_item_is_detected_by_missing_parent_id() {
+        let root: DriveItem = serde_json::from_value(serde_json::json!({
+            "id": "root1",
+            "name": "root",
+            "folder": {"childCount": 3},
+            "parentReference": {}
+        }))
+        .unwrap();
+        assert!(root.is_root());
+
+        let child: DriveItem = serde_json::from_value(serde_json::json!({
+            "id": "c1",
+            "name": "x",
+            "folder": {},
+            "parentReference": {"id": "root1"}
+        }))
+        .unwrap();
+        assert!(!child.is_root());
+    }
+
+    #[test]
+    fn remote_item_is_flagged() {
+        let item: DriveItem = serde_json::from_value(serde_json::json!({
+            "id": "r1",
+            "name": "Teams Chat Files",
+            "remoteItem": {"id": "other"}
+        }))
+        .unwrap();
+        assert!(item.is_remote_item());
+    }
+
+    #[test]
+    fn delta_response_links_parse() {
+        let resp: DeltaResponse = serde_json::from_value(serde_json::json!({
+            "value": [],
+            "@odata.deltaLink": "https://example/delta?token=t"
+        }))
+        .unwrap();
+        assert!(resp.items.is_empty());
+        assert!(resp.next_link.is_none());
+        assert_eq!(
+            resp.delta_link.as_deref(),
+            Some("https://example/delta?token=t")
+        );
+    }
+}

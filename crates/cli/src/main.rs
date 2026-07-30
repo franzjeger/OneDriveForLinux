@@ -407,3 +407,17 @@ fn config_path() -> std::path::PathBuf {
         .join("onedrive-linux")
         .join("config.toml")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::format_bytes;
+
+    #[test]
+    fn format_bytes_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1_048_576), "1.0 MB");
+        assert_eq!(format_bytes(1_610_612_736), "1.5 GB");
+    }
+}
