@@ -1,8 +1,8 @@
 mod dbus;
 
 use anyhow::{Context, Result};
-use futures::StreamExt;
 use fuse3::{raw::Session, MountOptions};
+use futures::StreamExt;
 use graph_client::{AuthManager, GraphClient};
 use signal_hook::consts::{SIGINT, SIGTERM};
 use signal_hook_tokio::Signals;
@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
         let existing_pid = existing.trim().parse::<u32>().unwrap_or(0);
         let stat_path = PathBuf::from(format!("/proc/{existing_pid}/stat"));
         let is_alive = std::fs::read_to_string(&stat_path)
-            .map(|s| !s.contains(") Z"))  // Z = zombie, not really running
+            .map(|s| !s.contains(") Z")) // Z = zombie, not really running
             .unwrap_or(false);
         if is_alive {
             anyhow::bail!(

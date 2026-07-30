@@ -1,13 +1,9 @@
 use ksni::{menu::*, Tray};
 use parking_lot::Mutex;
-use std::{
-    collections::VecDeque,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{collections::VecDeque, path::PathBuf, sync::Arc};
 use sync_engine::{SyncEvent, SyncState};
-use tracing::info;
 use tokio::sync::broadcast;
+use tracing::info;
 
 const MAX_RECENT: usize = 5;
 
@@ -166,7 +162,11 @@ impl Tray for OneDriveTray {
         items.push(MenuItem::Separator);
 
         // Pause / Resume — read state fresh inside the closure
-        let toggle_label = if is_paused { "Resume Sync" } else { "Pause Sync" };
+        let toggle_label = if is_paused {
+            "Resume Sync"
+        } else {
+            "Pause Sync"
+        };
         let toggle_icon = if is_paused {
             "media-playback-start"
         } else {
@@ -201,9 +201,7 @@ impl Tray for OneDriveTray {
             for (path, sync_state) in recent {
                 let label = format!(
                     "{} — {sync_state}",
-                    path.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("?")
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
                 );
                 items.push(
                     StandardItem {
@@ -302,7 +300,10 @@ pub fn spawn_tray(
                         st.status = TrayStatus::Idle;
                     }
                 }
-                SyncEvent::ItemStateChanged { path, state: sync_state } => {
+                SyncEvent::ItemStateChanged {
+                    path,
+                    state: sync_state,
+                } => {
                     st.push_recent(path, sync_state);
                 }
                 SyncEvent::Paused => {

@@ -68,14 +68,21 @@ fn try_az_cli_setup() -> Result<(String, String)> {
     // Create the app registration.
     println!("Creating app registration…");
     let create_json = az(&[
-        "ad", "app", "create",
-        "--display-name", "OneDrive for Linux",
-        "--sign-in-audience", "AzureADandPersonalMicrosoftAccount",
-        "--is-fallback-public-client", "true",
+        "ad",
+        "app",
+        "create",
+        "--display-name",
+        "OneDrive for Linux",
+        "--sign-in-audience",
+        "AzureADandPersonalMicrosoftAccount",
+        "--is-fallback-public-client",
+        "true",
         "--public-client-redirect-uris",
         "https://login.microsoftonline.com/common/oauth2/nativeclient",
-        "--query", "appId",
-        "-o", "tsv",
+        "--query",
+        "appId",
+        "-o",
+        "tsv",
     ])?;
     let client_id = create_json.trim().to_owned();
     if client_id.is_empty() {
@@ -85,10 +92,16 @@ fn try_az_cli_setup() -> Result<(String, String)> {
     // Add Files.ReadWrite.All delegated permission.
     println!("Adding Files.ReadWrite.All permission…");
     az(&[
-        "ad", "app", "permission", "add",
-        "--id", &client_id,
-        "--api", GRAPH_APP_ID,
-        "--api-permissions", &format!("{FILES_RW_ALL}=Scope"),
+        "ad",
+        "app",
+        "permission",
+        "add",
+        "--id",
+        &client_id,
+        "--api",
+        GRAPH_APP_ID,
+        "--api-permissions",
+        &format!("{FILES_RW_ALL}=Scope"),
     ])?;
 
     // Wait for Azure AD to propagate the new app registration before consenting.
@@ -97,7 +110,14 @@ fn try_az_cli_setup() -> Result<(String, String)> {
 
     // Grant admin consent.
     println!("Granting admin consent…");
-    match az(&["ad", "app", "permission", "admin-consent", "--id", &client_id]) {
+    match az(&[
+        "ad",
+        "app",
+        "permission",
+        "admin-consent",
+        "--id",
+        &client_id,
+    ]) {
         Ok(_) => {}
         Err(e) => {
             // Non-fatal: the user may grant consent interactively on first sign-in.

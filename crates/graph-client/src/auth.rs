@@ -5,8 +5,7 @@ use std::path::PathBuf;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-const TOKEN_ENDPOINT: &str =
-    "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token";
+const TOKEN_ENDPOINT: &str = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token";
 const DEVICE_CODE_ENDPOINT: &str =
     "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/devicecode";
 
@@ -73,8 +72,7 @@ pub struct AuthManager {
 impl AuthManager {
     pub fn new(client_id: String, tenant_id: String) -> Result<Self> {
         let config_dir = dirs_path();
-        std::fs::create_dir_all(&config_dir)
-            .context("create config dir")?;
+        std::fs::create_dir_all(&config_dir).context("create config dir")?;
         let token_path = config_dir.join("tokens.json");
 
         let http = reqwest::Client::builder()
@@ -82,10 +80,8 @@ impl AuthManager {
             .build()?;
 
         let token = if token_path.exists() {
-            let data = std::fs::read_to_string(&token_path)
-                .context("read tokens.json")?;
-            let ts: TokenSet = serde_json::from_str(&data)
-                .context("parse tokens.json")?;
+            let data = std::fs::read_to_string(&token_path).context("read tokens.json")?;
+            let ts: TokenSet = serde_json::from_str(&data).context("parse tokens.json")?;
             debug!("Loaded existing token set from disk");
             Some(ts)
         } else {
@@ -143,10 +139,7 @@ impl AuthManager {
         let url = DEVICE_CODE_ENDPOINT.replace("{tenant}", &self.tenant_id);
         let params = [
             ("client_id", self.client_id.as_str()),
-            (
-                "scope",
-                "Files.ReadWrite.All offline_access User.Read",
-            ),
+            ("scope", "Files.ReadWrite.All offline_access User.Read"),
         ];
         let resp = self.http.post(&url).form(&params).send().await?;
         let status = resp.status();
@@ -163,8 +156,7 @@ impl AuthManager {
         let interval = std::time::Duration::from_secs(dc.interval.max(5));
         // The device code itself expires — stop polling once it does instead
         // of looping forever on an abandoned sign-in.
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_secs(dc.expires_in);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(dc.expires_in);
 
         loop {
             tokio::time::sleep(interval).await;
@@ -196,8 +188,7 @@ impl AuthManager {
                     let ts = TokenSet {
                         access_token: resp.access_token.context("missing access_token")?,
                         refresh_token: resp.refresh_token,
-                        expires_at: Utc::now()
-                            + Duration::seconds(resp.expires_in.unwrap_or(3600)),
+                        expires_at: Utc::now() + Duration::seconds(resp.expires_in.unwrap_or(3600)),
                         token_type: resp.token_type.unwrap_or_else(|| "Bearer".into()),
                         scope: resp.scope.unwrap_or_default(),
                     };

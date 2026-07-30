@@ -6,8 +6,7 @@ use tracing::info;
 /// Removes any stale real files left by a previous non-FUSE run.
 pub fn prepare_mountpoint(path: &Path) -> Result<()> {
     if !path.exists() {
-        std::fs::create_dir_all(path)
-            .with_context(|| format!("create mountpoint {path:?}"))?;
+        std::fs::create_dir_all(path).with_context(|| format!("create mountpoint {path:?}"))?;
         info!("Created mountpoint {:?}", path);
         return Ok(());
     }
@@ -34,8 +33,7 @@ pub fn prepare_mountpoint(path: &Path) -> Result<()> {
         for entry in entries {
             let src = entry.path();
             let dest = backup.join(entry.file_name());
-            std::fs::rename(&src, &dest)
-                .with_context(|| format!("move {src:?} to {dest:?}"))?;
+            std::fs::rename(&src, &dest).with_context(|| format!("move {src:?} to {dest:?}"))?;
         }
     }
 
@@ -66,7 +64,10 @@ pub fn is_mounted(path: &Path) -> bool {
     mounts.lines().any(|line| {
         let mut parts = line.split_whitespace();
         parts.next(); // device
-        parts.next().map(|mp| mp == target.as_ref()).unwrap_or(false)
+        parts
+            .next()
+            .map(|mp| mp == target.as_ref())
+            .unwrap_or(false)
     })
 }
 

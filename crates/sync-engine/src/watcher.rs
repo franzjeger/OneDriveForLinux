@@ -24,8 +24,8 @@ impl LocalWatcher {
     pub fn new(root: &Path) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<Event>(512);
 
-        let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
-            match result {
+        let mut watcher =
+            notify::recommended_watcher(move |result: notify::Result<Event>| match result {
                 Ok(event) => {
                     if should_ignore_event(&event) {
                         return;
@@ -35,8 +35,7 @@ impl LocalWatcher {
                     }
                 }
                 Err(e) => warn!("Watcher error: {e}"),
-            }
-        })?;
+            })?;
 
         watcher.watch(root, RecursiveMode::Recursive)?;
         tracing::info!("Local watcher started: watching {:?}", root);
@@ -91,7 +90,9 @@ impl EventDebouncer {
     pub fn feed(&mut self, event: Event) -> Vec<Event> {
         let now = Instant::now();
         for path in &event.paths {
-            let entry = self.pending.entry(path.clone())
+            let entry = self
+                .pending
+                .entry(path.clone())
                 .or_insert_with(|| (event.clone(), now));
             // Always extend the debounce window on each new event for this path.
             entry.1 = now;
