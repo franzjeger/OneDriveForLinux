@@ -13,6 +13,7 @@ A native OneDrive client for Linux featuring:
 - **Pin / unpin** — keep chosen files or folders always on device, or free space back to cloud-only
 - **Download integrity** — every download is verified against the server's QuickXorHash
 - **Dolphin overlay icons** — sync-state emblems in KDE's file manager (see `extensions/dolphin/`)
+- **Status flyout** — left-click the tray icon for a window with live status, storage usage, and recent activity
 - **`odctl`** CLI for status, pause/resume, pinning, forced sync, and re-authentication
 
 ---
@@ -85,6 +86,7 @@ cargo build --release
 mkdir -p ~/.local/bin
 cp target/release/onedrive-daemon ~/.local/bin/
 cp target/release/odctl ~/.local/bin/
+cp target/release/onedrive-flyout ~/.local/bin/
 ```
 
 > The systemd unit runs the daemon from `~/.local/bin` — make sure it is on your `PATH`.

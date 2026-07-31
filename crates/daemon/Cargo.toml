@@ -22,3 +22,5 @@ dirs.workspace = true
 zbus = { version = "5", features = ["tokio"] }
 fuse3 = { version = "0.7", features = ["tokio-runtime", "unprivileged"] }
 futures.workspace = true
+parking_lot.workspace = true
+chrono.workspace = true

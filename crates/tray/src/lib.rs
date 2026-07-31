@@ -100,6 +100,11 @@ impl OneDriveTray {
 }
 
 impl Tray for OneDriveTray {
+    fn activate(&mut self, _x: i32, _y: i32) {
+        // Left click opens the status flyout window.
+        let _ = std::process::Command::new("onedrive-flyout").spawn();
+    }
+
     fn id(&self) -> String {
         "onedrive-linux".into()
     }

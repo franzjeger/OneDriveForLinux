@@ -16,6 +16,7 @@ echo "==> Installing binaries to $BIN_DIR/"
 mkdir -p "$BIN_DIR"
 cp target/release/onedrive-daemon "$BIN_DIR/"
 cp target/release/odctl "$BIN_DIR/"
+cp target/release/onedrive-flyout "$BIN_DIR/"
 
 if [ ! -f "$UNIT_DEST" ] || ! cmp -s "$UNIT_SRC" "$UNIT_DEST"; then
     echo "==> Installing systemd unit..."
