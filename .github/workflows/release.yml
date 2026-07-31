@@ -3,6 +3,11 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. v0.1.0) — creates the tag"
+        required: true
 
 permissions:
   contents: write
@@ -30,7 +35,7 @@ jobs:
 
       - name: Package
         run: |
-          VERSION="${GITHUB_REF_NAME}"
+          VERSION="${{ github.event.inputs.version || github.ref_name }}"
           DIST="onedrive-linux-${VERSION}-x86_64"
           mkdir -p "$DIST"
           cp target/release/onedrive-daemon target/release/odctl target/release/onedrive-flyout "$DIST/"
@@ -41,6 +46,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
           files: |
             onedrive-linux-*.tar.gz
             onedrive-linux-*.tar.gz.sha256
