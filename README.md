@@ -13,7 +13,7 @@ A native OneDrive client for Linux featuring:
 - **Pin / unpin** — keep chosen files or folders always on device, or free space back to cloud-only
 - **Download integrity** — every download is verified against the server's QuickXorHash
 - **Dolphin overlay icons** — sync-state emblems in KDE's file manager (see `extensions/dolphin/`)
-- **Status flyout** — left-click the tray icon for a window with live status, storage usage, and recent activity
+- **Status flyout** — left-click the tray icon for a window with live status, storage usage, and recent activity; expired sign-ins are fixed in two clicks with a graphical device-code flow
 - **`odctl`** CLI for status, pause/resume, pinning, forced sync, and re-authentication
 
 ---

@@ -13,6 +13,7 @@ pub struct OneDriveInterface {
     pub engine: Arc<SyncEngine>,
     pub graph: Arc<GraphClient>,
     pub recent: RecentBuffer,
+    pub needs_auth: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[interface(name = "com.onedrive.linux1")]
@@ -51,6 +52,11 @@ impl OneDriveInterface {
 
     async fn is_paused(&self) -> zbus::fdo::Result<bool> {
         Ok(self.engine.is_paused().await)
+    }
+
+    /// True when the daemon is waiting for the user to re-authenticate.
+    async fn needs_auth(&self) -> zbus::fdo::Result<bool> {
+        Ok(self.needs_auth.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Storage quota as (used, total) bytes. (0, 0) when unknown.
@@ -114,6 +120,7 @@ pub async fn export_dbus(
     engine: Arc<SyncEngine>,
     graph: Arc<GraphClient>,
     recent: RecentBuffer,
+    needs_auth: Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<Connection> {
     let conn = Connection::session().await?;
     conn.object_server()
@@ -123,6 +130,7 @@ pub async fn export_dbus(
                 engine,
                 graph,
                 recent,
+                needs_auth,
             },
         )
         .await?;
