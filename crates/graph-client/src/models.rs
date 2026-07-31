@@ -129,6 +129,26 @@ pub struct DeletedMetadata {
     pub state: Option<String>,
 }
 
+/// Drive metadata (subset) from GET /me/drive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveInfo {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota: Option<DriveQuota>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveQuota {
+    #[serde(default)]
+    pub used: u64,
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub remaining: u64,
+}
+
 /// Response from Graph API delta endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeltaResponse {

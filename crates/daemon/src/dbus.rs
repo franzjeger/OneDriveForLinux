@@ -1,10 +1,18 @@
+use graph_client::GraphClient;
+use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use sync_engine::SyncEngine;
 use tracing::info;
 use zbus::{fdo::RequestNameFlags, interface, Connection};
 
+/// Rolling buffer of recent item activity: (path, state, unix timestamp).
+pub type RecentBuffer = Arc<Mutex<VecDeque<(String, String, i64)>>>;
+
 pub struct OneDriveInterface {
     pub engine: Arc<SyncEngine>,
+    pub graph: Arc<GraphClient>,
+    pub recent: RecentBuffer,
 }
 
 #[interface(name = "com.onedrive.linux1")]
@@ -45,6 +53,25 @@ impl OneDriveInterface {
         Ok(self.engine.is_paused().await)
     }
 
+    /// Storage quota as (used, total) bytes. (0, 0) when unknown.
+    async fn get_quota(&self) -> zbus::fdo::Result<(u64, u64)> {
+        match self.graph.get_drive().await {
+            Ok(drive) => {
+                let q = drive.quota.unwrap_or_default();
+                Ok((q.used, q.total))
+            }
+            Err(e) => {
+                tracing::warn!("GetQuota: {e}");
+                Ok((0, 0))
+            }
+        }
+    }
+
+    /// Most recent item activity, newest first: (path, state, unix seconds).
+    async fn get_recent(&self) -> zbus::fdo::Result<Vec<(String, String, i64)>> {
+        Ok(self.recent.lock().iter().rev().cloned().collect())
+    }
+
     /// Mark a file or folder as always-on-device and download it immediately.
     async fn pin_item(&self, path: String) -> zbus::fdo::Result<()> {
         info!("D-Bus: PinItem {path}");
@@ -83,10 +110,21 @@ impl OneDriveInterface {
     }
 }
 
-pub async fn export_dbus(engine: Arc<SyncEngine>) -> anyhow::Result<Connection> {
+pub async fn export_dbus(
+    engine: Arc<SyncEngine>,
+    graph: Arc<GraphClient>,
+    recent: RecentBuffer,
+) -> anyhow::Result<Connection> {
     let conn = Connection::session().await?;
     conn.object_server()
-        .at("/com/onedrive/linux1", OneDriveInterface { engine })
+        .at(
+            "/com/onedrive/linux1",
+            OneDriveInterface {
+                engine,
+                graph,
+                recent,
+            },
+        )
         .await?;
 
     // Request the well-known name.

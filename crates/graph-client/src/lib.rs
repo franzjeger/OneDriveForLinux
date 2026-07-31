@@ -8,6 +8,6 @@ pub use auth::AuthManager;
 pub use client::GraphClient;
 pub use error::{GraphError, GraphResult};
 pub use models::{
-    DeltaResponse, DriveItem, FileMetadata, FileSystemInfo, FolderMetadata, Hashes, ItemReference,
-    UploadSession,
+    DeltaResponse, DriveInfo, DriveItem, DriveQuota, FileMetadata, FileSystemInfo, FolderMetadata,
+    Hashes, ItemReference, UploadSession,
 };

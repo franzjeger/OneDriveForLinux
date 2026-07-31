@@ -2,8 +2,8 @@ use crate::{
     auth::AuthManager,
     error::{GraphError, GraphResult},
     models::{
-        CreateFolderRequest, CreateUploadSessionRequest, DeltaResponse, DriveItem, MoveItemRequest,
-        MoveParentReference, UploadSession, UploadSessionItem,
+        CreateFolderRequest, CreateUploadSessionRequest, DeltaResponse, DriveInfo, DriveItem,
+        MoveItemRequest, MoveParentReference, UploadSession, UploadSessionItem,
     },
 };
 use bytes::Bytes;
@@ -192,6 +192,13 @@ impl GraphClient {
 
     pub async fn get_drive_root(&self) -> GraphResult<DriveItem> {
         let url = format!("{}/me/drive/root", self.base_url);
+        debug!("GET {url}");
+        self.get_json(&url).await
+    }
+
+    /// Drive metadata including the storage quota.
+    pub async fn get_drive(&self) -> GraphResult<DriveInfo> {
+        let url = format!("{}/me/drive", self.base_url);
         debug!("GET {url}");
         self.get_json(&url).await
     }
@@ -751,6 +758,26 @@ mod http_tests {
         let client = test_client(&server.uri(), dir.path());
         let root = client.get_drive_root().await.unwrap();
         assert_eq!(root.id, "root-id");
+    }
+
+    #[tokio::test]
+    async fn get_drive_parses_quota() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        Mock::given(method("GET"))
+            .and(path("/me/drive"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "drive1",
+                "quota": {"used": 340_000, "total": 1_000_000, "remaining": 660_000}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), dir.path());
+        let drive = client.get_drive().await.unwrap();
+        let quota = drive.quota.unwrap();
+        assert_eq!(quota.used, 340_000);
+        assert_eq!(quota.total, 1_000_000);
     }
 
     #[tokio::test]
