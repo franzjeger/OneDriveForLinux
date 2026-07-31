@@ -181,15 +181,10 @@ impl Tray for OneDriveTray {
                     label: "Sign in again…".into(),
                     icon_name: "dialog-password".into(),
                     activate: Box::new(|_| {
-                        // Open a terminal to run `odctl auth` so the user can see the device code.
-                        for terminal in &["konsole", "gnome-terminal", "xterm"] {
-                            let result = std::process::Command::new(terminal)
-                                .args(["-e", "odctl auth"])
-                                .spawn();
-                            if result.is_ok() {
-                                break;
-                            }
-                        }
+                        // The flyout renders the device code with copy/open buttons.
+                        let _ = std::process::Command::new("onedrive-flyout")
+                            .arg("--signin")
+                            .spawn();
                     }),
                     ..Default::default()
                 }

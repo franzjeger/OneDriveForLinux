@@ -16,6 +16,8 @@ pub trait OneDriveControl {
     fn get_recent(&self) -> zbus::Result<Vec<(String, String, i64)>>;
     fn pause(&self) -> zbus::Result<()>;
     fn resume(&self) -> zbus::Result<()>;
+    fn needs_auth(&self) -> zbus::Result<bool>;
+    fn start_auth(&self) -> zbus::Result<(String, String, String)>;
 }
 
 /// One UI-ready snapshot of everything the window shows.
@@ -23,6 +25,7 @@ pub trait OneDriveControl {
 pub struct Snapshot {
     pub reachable: bool,
     pub paused: bool,
+    pub needs_auth: bool,
     pub total_items: usize,
     pub syncing: usize,
     pub errors: usize,
@@ -55,6 +58,7 @@ impl DaemonClient {
         let mut snap = Snapshot {
             reachable: true,
             paused: proxy.is_paused().unwrap_or(false),
+            needs_auth: proxy.needs_auth().unwrap_or(false),
             total_items: items.len(),
             ..Default::default()
         };
@@ -89,6 +93,11 @@ impl DaemonClient {
                 .collect();
         }
         snap
+    }
+
+    /// Kick off the device-code flow. Returns (message, user code, url).
+    pub fn start_auth(&self) -> Option<(String, String, String)> {
+        self.proxy.as_ref().and_then(|p| p.start_auth().ok())
     }
 
     pub fn set_paused(&self, pause: bool) {

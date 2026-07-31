@@ -14,10 +14,21 @@ const MUTED: Color32 = Color32::from_rgb(0x8E, 0x9C, 0xAC);
 
 const REFRESH: Duration = Duration::from_secs(2);
 
+enum View {
+    Status,
+    /// Device-code sign-in: message, user code, verification URL.
+    SignIn {
+        user_code: String,
+        url: String,
+        copied: bool,
+    },
+}
+
 pub struct FlyoutApp {
     client: DaemonClient,
     snap: Snapshot,
     last_fetch: Instant,
+    view: View,
 }
 
 impl FlyoutApp {
@@ -27,10 +38,27 @@ impl FlyoutApp {
         });
         let client = DaemonClient::connect();
         let snap = client.fetch();
-        Self {
+        let mut app = Self {
             client,
             snap,
             last_fetch: Instant::now(),
+            view: View::Status,
+        };
+        // `onedrive-flyout --signin` (used by the tray's "Sign in" action)
+        // jumps straight into the sign-in flow.
+        if std::env::args().any(|a| a == "--signin") {
+            app.begin_sign_in();
+        }
+        app
+    }
+
+    fn begin_sign_in(&mut self) {
+        if let Some((_msg, user_code, url)) = self.client.start_auth() {
+            self.view = View::SignIn {
+                user_code,
+                url,
+                copied: false,
+            };
         }
     }
 
@@ -40,6 +68,8 @@ impl FlyoutApp {
             (MUTED, "Daemon not running".into())
         } else if s.paused {
             (WARN, "Paused".into())
+        } else if s.needs_auth {
+            (WARN, "Sign in required".into())
         } else if s.errors > 0 {
             (BAD, format!("Needs attention · {} errors", s.errors))
         } else if s.syncing > 0 {
@@ -71,16 +101,99 @@ impl eframe::App for FlyoutApp {
         }
         ctx.request_repaint_after(REFRESH);
 
+        if let View::SignIn {
+            user_code,
+            url,
+            copied,
+        } = &mut self.view
+        {
+            let user_code = user_code.clone();
+            let url = url.clone();
+            let was_copied = *copied;
+            // Auth finished (daemon resumed): return to the status view.
+            if !self.snap.needs_auth && self.snap.reachable && !self.snap.paused {
+                self.view = View::Status;
+                return;
+            }
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add_space(10.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("☁").size(34.0).color(ACCENT));
+                    ui.label(RichText::new("Sign in to OneDrive").strong().size(17.0));
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Enter this code on the Microsoft sign-in page:")
+                            .color(MUTED)
+                            .size(12.5),
+                    );
+                    ui.add_space(8.0);
+                    egui::Frame::none()
+                        .fill(ACCENT.gamma_multiply(0.12))
+                        .rounding(Rounding::same(8.0))
+                        .inner_margin(egui::Margin::symmetric(18.0, 10.0))
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(&user_code)
+                                    .monospace()
+                                    .size(24.0)
+                                    .strong()
+                                    .color(ACCENT),
+                            );
+                        });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(ui.available_width() / 2.0 - 110.0);
+                        let copy_label = if was_copied {
+                            "Copied ✓"
+                        } else {
+                            "Copy code"
+                        };
+                        if ui.button(copy_label).clicked() {
+                            ui.output_mut(|o| o.copied_text = user_code.clone());
+                            if let View::SignIn { copied, .. } = &mut self.view {
+                                *copied = true;
+                            }
+                        }
+                        if ui.button("Open sign-in page").clicked() {
+                            let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+                        }
+                    });
+                    ui.add_space(14.0);
+                    ui.spinner();
+                    ui.label(
+                        RichText::new(
+                            "Waiting for you to finish signing in…
+Sync resumes automatically.",
+                        )
+                        .color(MUTED)
+                        .size(11.5),
+                    );
+                });
+            });
+            return;
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             // ── Header ────────────────────────────────────────────────
             let (color, text) = self.headline();
+            let mut sign_in_clicked = false;
             ui.horizontal(|ui| {
                 ui.label(RichText::new("☁").size(24.0).color(ACCENT));
                 ui.vertical(|ui| {
                     ui.label(RichText::new("OneDrive").strong().size(16.0));
                     ui.label(RichText::new(text).color(color).size(12.5));
                 });
+                if self.snap.needs_auth {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Sign in…").clicked() {
+                            sign_in_clicked = true;
+                        }
+                    });
+                }
             });
+            if sign_in_clicked {
+                self.begin_sign_in();
+            }
 
             // ── Storage ───────────────────────────────────────────────
             let s = &self.snap;

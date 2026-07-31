@@ -156,38 +156,56 @@ async fn main() -> Result<()> {
     // Feed a rolling buffer from sync events so the flyout can show activity
     // without the engine knowing anything about UIs.
     let recent: dbus::RecentBuffer = Arc::new(parking_lot::Mutex::new(Default::default()));
+    let needs_auth = Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
+        use std::sync::atomic::Ordering;
         let mut rx = engine.subscribe();
         let recent = Arc::clone(&recent);
+        let needs_auth = Arc::clone(&needs_auth);
         tokio::spawn(async move {
             while let Ok(event) = rx.recv().await {
-                if let sync_engine::SyncEvent::ItemStateChanged { path, state } = event {
-                    let mut buf = recent.lock();
-                    let entry = (
-                        path.to_string_lossy().to_string(),
-                        state.to_string(),
-                        chrono::Utc::now().timestamp(),
-                    );
-                    buf.retain(|(p, _, _)| p != &entry.0);
-                    buf.push_back(entry);
-                    while buf.len() > 20 {
-                        buf.pop_front();
+                match event {
+                    sync_engine::SyncEvent::ItemStateChanged { path, state } => {
+                        let mut buf = recent.lock();
+                        let entry = (
+                            path.to_string_lossy().to_string(),
+                            state.to_string(),
+                            chrono::Utc::now().timestamp(),
+                        );
+                        buf.retain(|(p, _, _)| p != &entry.0);
+                        buf.push_back(entry);
+                        while buf.len() > 20 {
+                            buf.pop_front();
+                        }
                     }
+                    sync_engine::SyncEvent::AuthRequired => {
+                        needs_auth.store(true, Ordering::Relaxed);
+                    }
+                    // A successful re-auth resumes sync.
+                    sync_engine::SyncEvent::Resumed | sync_engine::SyncEvent::SyncStarted => {
+                        needs_auth.store(false, Ordering::Relaxed);
+                    }
+                    _ => {}
                 }
             }
         });
     }
 
     // ── D-Bus ──────────────────────────────────────────────────────────────────
-    let _dbus_conn =
-        match dbus::export_dbus(Arc::clone(&engine), Arc::clone(&graph), Arc::clone(&recent)).await
-        {
-            Ok(conn) => Some(conn),
-            Err(e) => {
-                error!("D-Bus interface unavailable (odctl won't work): {e}");
-                None
-            }
-        };
+    let _dbus_conn = match dbus::export_dbus(
+        Arc::clone(&engine),
+        Arc::clone(&graph),
+        Arc::clone(&recent),
+        Arc::clone(&needs_auth),
+    )
+    .await
+    {
+        Ok(conn) => Some(conn),
+        Err(e) => {
+            error!("D-Bus interface unavailable (odctl won't work): {e}");
+            None
+        }
+    };
 
     // ── Signal handling ────────────────────────────────────────────────────────
     let mut signals = Signals::new([SIGTERM, SIGINT]).context("register signals")?;
