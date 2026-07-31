@@ -61,3 +61,31 @@ Kate editor lager swap-filer med suffikset `.kate-swp`. Disse ble ikke filtrert 
 - Upload-side konfliktdeteksjon (etag-sjekk før opplasting)
 - `sync_folders`-filter for `handle_local_event` (nå lastes alle filer i `~/OneDrive/` opp, ikke bare `sync_folders`)
 - Systemd auto-start ved innlogging (ukjent årsak til sporadisk feil)
+
+---
+
+## 2026-07-30 — Stor kvalitets- og robusthetsgjennomgang
+
+Full gjennomgang av hele kodebasen over 9 PR-er (+6 dependency-PR-er), alle merget med grønn CI:
+
+### Kritiske feil fikset
+- **Datatap 1:** `prepare_mountpoint` slettet alt innhold i sync-katalogen ved bytte til on_demand — flyttes nå til `.pre-fuse-backup` i stedet.
+- **Datatap 2:** `reconcile_deleted_items` slettet lokalt opprettede filer (`_local_`-ID-er) med ventende opplasting etter full delta-synk.
+- **Datatap 3 (potensielt):** ekskluderingsmønstre var case-sensitive (`thumbs.db` traff ikke `Thumbs.db`).
+- **Token-rotasjon:** samtidige token-refresh kunne ugyldiggjøre refresh-tokenet (Microsoft roterer dem) — nå serialisert bak mutex.
+- **Minne:** opplasting av store filer leste hele filen inn i RAM — nå chunk-strømming fra disk.
+- Sårbare `rustls-webpki`-versjoner fjernet (ubrukt `oauth2`-crate droppet helt).
+
+### Ny infrastruktur
+- CI (fmt + clippy -D warnings + test), sikkerhetsaudit (cargo-audit), Dependabot, release-workflow (tag → GitHub Release).
+- 50 tester (fra 0): enhets-, delta-integrasjons- og mock-HTTP-tester (wiremock).
+- QuickXorHash-verifisering av alle nedlastinger (warn-only inntil feltvalidert).
+- FUSE `forget()` med lookup-telling — inode-tabellen vokser ikke lenger ubegrenset.
+- `rmdir` implementert; `readdirplus` rapporterer riktige attributter.
+- Engine splittet i moduler (`engine/{mod,delta,local,pin}.rs`).
+
+### Gjenstående (fra forrige logg + nytt)
+- Feltvalidering av QuickXorHash mot ekte OneDrive → oppgrader til hard-fail.
+- Upload-side konfliktdeteksjon (etag-sjekk før opplasting) — fortsatt åpen.
+- `sync_folders`-filter for `handle_local_event` — fortsatt åpen.
+- Dogfooding mot ekte OneDrive før v0.1.0-tag.

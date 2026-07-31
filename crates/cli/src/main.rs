@@ -36,8 +36,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Show sync status of all tracked files
-    Status,
+    /// Show sync status (summary; use --all for every tracked file)
+    Status {
+        /// List every tracked file instead of the summary
+        #[arg(long)]
+        all: bool,
+    },
 
     /// Pause sync
     Pause,
@@ -99,7 +103,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Status => cmd_status().await,
+        Command::Status { all } => cmd_status(all).await,
         Command::PinStatus { path } => cmd_pin_status(path).await,
         Command::Pause => cmd_pause().await,
         Command::Resume => cmd_resume().await,
@@ -117,7 +121,46 @@ async fn make_proxy(conn: &Connection) -> Result<OneDriveControlProxy<'_>> {
         .context("connect to daemon via D-Bus — is onedrive-daemon running?")
 }
 
-async fn cmd_status() -> Result<()> {
+/// ANSI styling that steps aside when piped or when NO_COLOR is set.
+struct Style {
+    on: bool,
+}
+
+impl Style {
+    fn detect() -> Self {
+        use std::io::IsTerminal;
+        Self {
+            on: std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+        }
+    }
+    fn paint(&self, code: &str, text: &str) -> String {
+        if self.on {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
+    }
+    fn good(&self, t: &str) -> String {
+        self.paint("32", t)
+    }
+    fn accent(&self, t: &str) -> String {
+        self.paint("34", t)
+    }
+    fn warn(&self, t: &str) -> String {
+        self.paint("33", t)
+    }
+    fn bad(&self, t: &str) -> String {
+        self.paint("31", t)
+    }
+    fn dim(&self, t: &str) -> String {
+        self.paint("2", t)
+    }
+    fn bold(&self, t: &str) -> String {
+        self.paint("1", t)
+    }
+}
+
+async fn cmd_status(all: bool) -> Result<()> {
     let conn = Connection::session()
         .await
         .context("connect to D-Bus session bus")?;
@@ -125,22 +168,101 @@ async fn cmd_status() -> Result<()> {
 
     let items = proxy.get_status().await.context("get_status D-Bus call")?;
     let paused = proxy.is_paused().await.unwrap_or(false);
-
-    if paused {
-        println!("[PAUSED]");
-    }
+    let style = Style::detect();
 
     if items.is_empty() {
         println!("No items tracked yet.");
         return Ok(());
     }
 
-    let rows: Vec<StatusRow> = items
-        .into_iter()
-        .map(|(path, state)| StatusRow { path, state })
-        .collect();
+    if all {
+        if paused {
+            println!("{}", style.warn("[PAUSED]"));
+        }
+        let rows: Vec<StatusRow> = items
+            .into_iter()
+            .map(|(path, state)| StatusRow { path, state })
+            .collect();
+        println!("{}", Table::new(rows));
+        return Ok(());
+    }
 
-    println!("{}", Table::new(rows));
+    // Summary first: the answer before the list.
+    let mut synced = 0u32;
+    let mut syncing: Vec<&str> = Vec::new();
+    let mut cloud = 0u32;
+    let mut pinned = 0u32;
+    let mut local = 0u32;
+    let mut errors: Vec<(&str, &str)> = Vec::new();
+    for (path, state) in &items {
+        match state.as_str() {
+            "Synced" | "Partially synced" => synced += 1,
+            "Syncing" => syncing.push(path),
+            "Cloud only" => cloud += 1,
+            "Pinned" => pinned += 1,
+            "Local only" => local += 1,
+            s if s.starts_with("Error") => errors.push((path, state)),
+            "Conflict" => errors.push((path, state)),
+            _ => {}
+        }
+    }
+
+    let headline = if paused {
+        style.warn("⏸ paused")
+    } else if !errors.is_empty() {
+        style.bad("● needs attention")
+    } else if !syncing.is_empty() {
+        style.accent("↻ syncing")
+    } else {
+        style.good("● up to date")
+    };
+    println!(
+        "{}  {} {}",
+        style.bold("OneDrive"),
+        headline,
+        style.dim(&format!("· {} items tracked", items.len()))
+    );
+    println!();
+    println!(
+        "  {}   {}   {}   {}   {}",
+        style.good(&format!("✓ {synced} synced")),
+        style.warn(&format!("● {pinned} pinned")),
+        style.dim(&format!("○ {cloud} cloud-only")),
+        style.accent(&format!("↻ {} syncing", syncing.len())),
+        if errors.is_empty() {
+            style.dim("✗ 0 errors")
+        } else {
+            style.bad(&format!("✗ {} errors", errors.len()))
+        },
+    );
+    if local > 0 {
+        println!("  {}", style.dim(&format!("↑ {local} awaiting upload")));
+    }
+
+    if !syncing.is_empty() {
+        println!();
+        for path in syncing.iter().take(5) {
+            println!("  {} {path}", style.accent("↻"));
+        }
+        if syncing.len() > 5 {
+            println!(
+                "  {}",
+                style.dim(&format!("… and {} more", syncing.len() - 5))
+            );
+        }
+    }
+    if !errors.is_empty() {
+        println!();
+        for (path, state) in errors.iter().take(5) {
+            println!("  {} {path} {}", style.bad("✗"), style.dim(state));
+        }
+    }
+
+    println!();
+    println!(
+        "{}",
+        style.dim("Run `odctl status --all` for the full table.")
+    );
     Ok(())
 }
 

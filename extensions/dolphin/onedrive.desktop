@@ -2,17 +2,26 @@
 Type=Service
 X-KDE-ServiceTypes=KonqPopupMenu/Plugin
 MimeType=inode/directory;all/allfiles;
-Actions=OneDrivePin;OneDriveUnpin;
+Actions=OneDrivePin;OneDriveUnpin;OneDriveSync;
 X-KDE-Priority=TopLevel
+X-KDE-Submenu=OneDrive
+X-KDE-Submenu[nb]=OneDrive
+Icon=folder-cloud
 
 [Desktop Action OneDrivePin]
-Name=Keep on device
-Name[nb]=Behold på enheten
+Name=Always keep on this device
+Name[nb]=Behold alltid på enheten
 Icon=folder-download
-Exec=/home/frank/.local/bin/odctl pin %F
+Exec=odctl pin %F
 
 [Desktop Action OneDriveUnpin]
 Name=Free up space
 Name[nb]=Frigjør plass
 Icon=folder-cloud
-Exec=/home/frank/.local/bin/odctl unpin %F
+Exec=odctl unpin %F
+
+[Desktop Action OneDriveSync]
+Name=Sync now
+Name[nb]=Synkroniser nå
+Icon=view-refresh
+Exec=odctl sync %f

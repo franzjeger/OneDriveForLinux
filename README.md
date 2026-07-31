@@ -10,7 +10,10 @@ A native OneDrive client for Linux featuring:
 - **OAuth2 device code flow** — no client secret required
 - **Full Microsoft Graph API** sync with delta polling
 - **Conflict resolution** — local conflicts are renamed with timestamps
-- **`odctl`** CLI for status, pause/resume, and forced sync
+- **Pin / unpin** — keep chosen files or folders always on device, or free space back to cloud-only
+- **Download integrity** — every download is verified against the server's QuickXorHash
+- **Dolphin overlay icons** — sync-state emblems in KDE's file manager (see `extensions/dolphin/`)
+- **`odctl`** CLI for status, pause/resume, pinning, forced sync, and re-authentication
 
 ---
 
@@ -130,8 +133,21 @@ odctl resume
 odctl sync ~/OneDrive/Documents/report.docx
 odctl sync   # syncs the entire OneDrive root
 
+# Keep files/folders always on device (downloads now, never evicted)
+odctl pin ~/OneDrive/Documents ~/OneDrive/Photos/family.jpg
+
+# Free up space — back to cloud-only placeholders
+odctl unpin ~/OneDrive/Photos
+
+# Are my pinned files actually on disk?
+odctl pin-status
+odctl pin-status ~/OneDrive/Documents
+
 # Show current config
 odctl config
+
+# Re-authenticate via the running daemon (prints a device code)
+odctl auth
 
 # Sign out (removes saved tokens)
 odctl auth --signout
@@ -142,6 +158,8 @@ odctl auth --signout
 ## Files On-Demand
 
 When `on_demand = true` (the default), the sync directory is mounted as a FUSE filesystem. Files appear with their real sizes but occupy **zero local disk space** until you access them. Opening a file triggers a transparent download — the same behaviour as OneDrive on macOS/Windows.
+
+Use `odctl pin` to keep specific files or folders permanently on device — pinned items are downloaded immediately, survive delta syncs, and are never evicted until you `odctl unpin` them.
 
 To disable Files On-Demand and always download everything:
 
@@ -161,6 +179,34 @@ The daemon communicates icon state via the StatusNotifier/AppIndicator D-Bus pro
 | `emblem-synchronizing` | Syncing |
 | `dialog-error` | Sync error or sign-in required |
 | `media-playback-pause` | Sync paused |
+
+---
+
+## Dolphin Overlay Icons (KDE)
+
+`extensions/dolphin/` integrates OneDrive into KDE's file manager:
+
+- **Overlay icons** — a `KOverlayIconPlugin` shows sync-state emblems (synced ✓, syncing, cloud-only, error) by reading the `user.onedrive.syncstate` extended attribute served by the FUSE mount.
+- **Right-click menu** — an "OneDrive" submenu on any file or folder with *Always keep on this device*, *Free up space*, and *Sync now* (a KIO service menu calling `odctl`; requires `odctl` on your `PATH`).
+
+```bash
+cd extensions/dolphin
+./build.sh && ./install.sh   # requires KDE Frameworks 6 dev packages
+```
+
+---
+
+## Development
+
+CI enforces formatting, lints, tests, and a dependency security audit on every PR:
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Releases are automated: pushing a tag like `v0.1.0` builds the binaries and publishes a GitHub Release with a checksummed tarball.
 
 ---
 
