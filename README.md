@@ -184,7 +184,10 @@ The daemon communicates icon state via the StatusNotifier/AppIndicator D-Bus pro
 
 ## Dolphin Overlay Icons (KDE)
 
-A `KOverlayIconPlugin` in `extensions/dolphin/` shows sync-state emblems directly in Dolphin (synced ✓, syncing, cloud-only, error). It reads the `user.onedrive.syncstate` extended attribute served by the FUSE mount:
+`extensions/dolphin/` integrates OneDrive into KDE's file manager:
+
+- **Overlay icons** — a `KOverlayIconPlugin` shows sync-state emblems (synced ✓, syncing, cloud-only, error) by reading the `user.onedrive.syncstate` extended attribute served by the FUSE mount.
+- **Right-click menu** — an "OneDrive" submenu on any file or folder with *Always keep on this device*, *Free up space*, and *Sync now* (a KIO service menu calling `odctl`; requires `odctl` on your `PATH`).
 
 ```bash
 cd extensions/dolphin
