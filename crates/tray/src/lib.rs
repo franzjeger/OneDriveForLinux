@@ -1,3 +1,6 @@
+mod icons;
+
+use icons::IconState;
 use ksni::{menu::*, Tray};
 use parking_lot::Mutex;
 use std::{collections::VecDeque, path::PathBuf, sync::Arc};
@@ -22,6 +25,16 @@ enum TrayStatus {
 }
 
 impl TrayStatus {
+    fn icon_state(&self) -> IconState {
+        match self {
+            TrayStatus::Idle => IconState::Ok,
+            TrayStatus::Syncing => IconState::Syncing,
+            TrayStatus::Error(_) => IconState::Error,
+            TrayStatus::Paused => IconState::Paused,
+            TrayStatus::AuthRequired => IconState::AuthRequired,
+        }
+    }
+
     fn icon_name(&self) -> &str {
         match self {
             TrayStatus::Idle => ICON_IDLE,
@@ -96,7 +109,12 @@ impl Tray for OneDriveTray {
     }
 
     fn icon_name(&self) -> String {
+        // Themed fallback for hosts that ignore pixmaps.
         self.state.lock().status.icon_name().to_string()
+    }
+
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        icons::render(self.state.lock().status.icon_state())
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
@@ -119,6 +137,21 @@ impl Tray for OneDriveTray {
         drop(st); // release lock before building closures
 
         let mut items: Vec<MenuItem<Self>> = Vec::new();
+
+        // Status header — the first thing the menu says is the app's state.
+        let status_line = {
+            let st = self.state.lock();
+            st.status.tooltip()
+        };
+        items.push(
+            StandardItem {
+                label: status_line,
+                enabled: false,
+                ..Default::default()
+            }
+            .into(),
+        );
+        items.push(MenuItem::Separator);
 
         // Open folder
         items.push(
@@ -268,6 +301,33 @@ impl Tray for OneDriveTray {
 
         items
     }
+}
+
+/// Render every icon state to `dir` as PNGs (dev tool — see examples/render_icons).
+pub fn render_icon_previews(dir: &std::path::Path) -> anyhow::Result<()> {
+    use icons::IconState;
+    for (state, name) in [
+        (IconState::Ok, "up-to-date"),
+        (IconState::Syncing, "syncing"),
+        (IconState::Paused, "paused"),
+        (IconState::AuthRequired, "sign-in-needed"),
+        (IconState::Error, "error"),
+    ] {
+        for icon in icons::render(state) {
+            let mut pixmap = tiny_skia::Pixmap::new(icon.width as u32, icon.height as u32)
+                .ok_or_else(|| anyhow::anyhow!("pixmap alloc"))?;
+            // Convert ARGB network order back to RGBA for PNG encoding.
+            for (dst, src) in pixmap
+                .data_mut()
+                .chunks_exact_mut(4)
+                .zip(icon.data.chunks_exact(4))
+            {
+                dst.copy_from_slice(&[src[1], src[2], src[3], src[0]]);
+            }
+            pixmap.save_png(dir.join(format!("{name}-{}.png", icon.width)))?;
+        }
+    }
+    Ok(())
 }
 
 /// Spawn the tray in the background, listening to SyncEvents and updating the icon/menu.
