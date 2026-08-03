@@ -179,6 +179,32 @@ impl SyncEngine {
     /// Returns (message, user_code, verification_uri) for display to the user.
     /// Polls for the token in the background and auto-resumes sync when done.
     pub async fn start_reauthenticate(self: Arc<Self>) -> anyhow::Result<(String, String, String)> {
+        // Browser sign-in has no user code — the caller shows a "finish in
+        // your browser" message instead of a code card.
+        if self.config.auth_preference() == Some(true) {
+            let auth = Arc::clone(&self.auth);
+            let engine = Arc::clone(&self);
+            tokio::spawn(async move {
+                match auth.authenticate_browser().await {
+                    Ok(()) => {
+                        info!("Browser re-authentication complete — resuming sync");
+                        engine.resume().await;
+                    }
+                    Err(e) => {
+                        error!("Browser re-authentication failed: {e}");
+                        let _ = engine
+                            .event_tx
+                            .send(SyncEvent::Error(format!("Re-auth failed: {e}")));
+                    }
+                }
+            });
+            return Ok((
+                "Finish signing in in your browser — sync resumes automatically.".to_string(),
+                String::new(),
+                String::new(),
+            ));
+        }
+
         let dc = self.auth.start_device_code_flow().await?;
         let info = (
             dc.message.clone(),

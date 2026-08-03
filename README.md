@@ -77,6 +77,7 @@ sudo usermod -aG fuse $USER
 7. Go to **API permissions → Add a permission → Microsoft Graph → Delegated permissions**.
 8. Add: `Files.ReadWrite.All`, `offline_access`, `User.Read`.
 9. Click **Grant admin consent** (or ask your tenant admin to do so).
+10. Under **Authentication → Add a platform → Mobile and desktop applications**, add the redirect URI `http://localhost`. This enables browser sign-in (see below); Azure accepts any port on `http://localhost` for desktop apps.
 
 > **Personal accounts (Outlook.com / Hotmail.com):** No admin consent is needed. Just add the permissions and proceed.
 
@@ -98,8 +99,21 @@ client_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 # max_upload_threads = 4
 # max_download_threads = 4
 # excluded_patterns = ["*.tmp", "~$*", ".~lock.*", "desktop.ini", "thumbs.db"]
+# auth_method = "auto"          # "auto" | "browser" | "device_code"
 EOF
 ```
+
+### Sign-in methods
+
+`auth_method` decides how you authenticate:
+
+| Value | Behaviour |
+|-------|-----------|
+| `auto` (default) | Browser sign-in when a desktop session is detected, device code otherwise |
+| `browser` | Always use the browser (authorization code flow with PKCE) |
+| `device_code` | Always show a code to type on another device |
+
+**If sign-in fails with `AADSTS53003`**, your tenant's Conditional Access blocks the device code flow — a common (and sensible) policy. Set `auth_method = "browser"` and make sure `http://localhost` is registered as a redirect URI (Step 1.10 above). Browser sign-in goes through the normal interactive flow, so MFA and device policies apply as usual.
 
 ---
 

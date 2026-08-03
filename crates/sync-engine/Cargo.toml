@@ -13,7 +13,7 @@ thiserror.workspace = true
 tracing.workspace = true
 rusqlite = { version = "0.40", features = ["bundled"] }
 notify = "8"
-sha2 = "0.11"
+sha2.workspace = true
 hex = "0.4"
 chrono.workspace = true
 tokio-stream = "0.1"
@@ -23,7 +23,7 @@ parking_lot.workspace = true
 dashmap = "6"
 libc.workspace = true
 walkdir = "2"
-base64 = "0.22"
+base64.workspace = true
 toml = "0.8"
 
 [dev-dependencies]

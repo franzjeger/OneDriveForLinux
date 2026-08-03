@@ -38,6 +38,10 @@ fn default_sync_folders() -> Vec<String> {
     vec![]
 }
 
+fn default_auth_method() -> String {
+    "auto".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Local directory to sync OneDrive files into.
@@ -77,6 +81,24 @@ pub struct Config {
     /// Seconds between delta polls.
     #[serde(default = "default_poll_interval")]
     pub delta_poll_interval_secs: u64,
+
+    /// How to sign in: "auto" (browser when a desktop session is present),
+    /// "browser" (authorization code + PKCE — required when Conditional
+    /// Access blocks the device code flow), or "device_code".
+    #[serde(default = "default_auth_method")]
+    pub auth_method: String,
+}
+
+impl Config {
+    /// `Some(true)` to force browser sign-in, `Some(false)` to force device
+    /// code, `None` to let the auth layer decide from the environment.
+    pub fn auth_preference(&self) -> Option<bool> {
+        match self.auth_method.as_str() {
+            "browser" => Some(true),
+            "device_code" | "devicecode" => Some(false),
+            _ => None,
+        }
+    }
 }
 
 impl Config {
@@ -116,6 +138,7 @@ impl Config {
             max_upload_threads: 4,
             max_download_threads: 4,
             delta_poll_interval_secs: 30,
+            auth_method: default_auth_method(),
         };
         cfg.save()
     }
@@ -143,6 +166,21 @@ mod tests {
         assert_eq!(cfg.delta_poll_interval_secs, 30);
         assert!(cfg.excluded_patterns.contains(&"*.tmp".to_string()));
         assert!(cfg.sync_folders.is_empty());
+    }
+
+    #[test]
+    fn auth_method_preference() {
+        let auto: Config = toml::from_str(r#"client_id = "a""#).unwrap();
+        assert_eq!(auto.auth_method, "auto");
+        assert_eq!(auto.auth_preference(), None);
+
+        let browser: Config =
+            toml::from_str("client_id = \"a\"\nauth_method = \"browser\"").unwrap();
+        assert_eq!(browser.auth_preference(), Some(true));
+
+        let device: Config =
+            toml::from_str("client_id = \"a\"\nauth_method = \"device_code\"").unwrap();
+        assert_eq!(device.auth_preference(), Some(false));
     }
 
     #[test]

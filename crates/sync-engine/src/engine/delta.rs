@@ -546,6 +546,7 @@ mod delta_tests {
             max_upload_threads: 1,
             max_download_threads: 1,
             delta_poll_interval_secs: 30,
+            auth_method: "device_code".into(),
         });
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open(&dir.path().join("test.db")).unwrap());
