@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Overlay emblem: file lives in the cloud only, nothing on disk.
+       Drawn at 16px because KDE composites overlays at emblem size; the
+       dark outline keeps it legible on both light and dark thumbnails. -->
+  <g>
+    <path d="M4.6 12.4a3.3 3.3 0 0 1-.35-6.58 4.5 4.5 0 0 1 8.46-1.05 3.05 3.05 0 0 1 .32 6.06l-.18.01z"
+          fill="#12181F" fill-opacity=".55" transform="translate(0,.6)"/>
+    <path d="M4.6 12.4a3.3 3.3 0 0 1-.35-6.58 4.5 4.5 0 0 1 8.46-1.05 3.05 3.05 0 0 1 .32 6.06l-.18.01z"
+          fill="#E8EDF3" stroke="#12181F" stroke-opacity=".65" stroke-width=".9"/>
+  </g>
+</svg>

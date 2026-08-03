@@ -12,7 +12,7 @@ A native OneDrive client for Linux featuring:
 - **Conflict resolution** — local conflicts are renamed with timestamps
 - **Pin / unpin** — keep chosen files or folders always on device, or free space back to cloud-only
 - **Download integrity** — every download is verified against the server's QuickXorHash
-- **Dolphin overlay icons** — sync-state emblems in KDE's file manager (see `extensions/dolphin/`)
+- **Dolphin overlay icons** — sync-state emblems on file icons in KDE's file manager, so you can see at a glance what is on disk and what is still in the cloud. Opt in with `--with-dolphin-overlay` (see `extensions/dolphin/README.md`)
 - **Installs as a desktop app** — an entry in the application menu and KRunner, a tray icon, and autostart at login; the terminal is never required after install
 - **Status flyout** — left-click the tray icon for a window with live status, storage usage, and recent activity; expired sign-ins are fixed in two clicks with a graphical device-code flow
 - **Uploads are never dropped** — a failed upload is queued in the database, retried with backoff, and survives a daemon restart; you are notified only if it is given up on
@@ -284,6 +284,8 @@ crates/
 **"connect to daemon via D-Bus"** — the daemon must be running before using `odctl`. Start it with `systemctl --user start onedrive-linux.service`, or just open the OneDrive app from your application menu — it starts the service itself.
 
 **"You are not authorized to execute this file"** when using the OneDrive right-click menu in Dolphin — Plasma refuses to run a service menu whose `.desktop` file is not executable. Fix it with `chmod +x ~/.local/share/kio/servicemenus/onedrive.desktop`, or re-run the installer (v0.5.1 and later set the bit).
+
+**No sync-state emblems in Dolphin** — the overlay plugin is opt-in, because it is C++ and needs the KDE Frameworks 6 development packages. Re-run the installer with `--with-dolphin-overlay`, then restart Dolphin (`kquitapp6 dolphin`). To check what the filesystem reports for a file without the plugin: `getfattr -n user.onedrive.syncstate ~/OneDrive/some-file`.
 
 **No "OneDrive" entry in the application menu** — some desktops cache the menu. Run `update-desktop-database ~/.local/share/applications` and log out and back in. Verify the entry exists at `~/.local/share/applications/onedrive-linux.desktop`.
 

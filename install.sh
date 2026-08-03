@@ -14,6 +14,10 @@
 #   --version vX.Y.Z   Install a specific release (default: latest)
 #   --local            Install binaries from the current directory instead of downloading
 #   --no-service       Install files only; don't enable/start the systemd service
+#   --with-dolphin-overlay
+#                      Also build and install the Dolphin sync-state overlay
+#                      plugin (needs a C++ toolchain and the KDE Frameworks 6
+#                      development packages; installs system-wide via sudo)
 #   --uninstall        Remove binaries, service, and Dolphin menu (config/tokens kept)
 #   --purge            With --uninstall: also remove config, tokens, and local database
 set -euo pipefail
@@ -32,6 +36,7 @@ CLIENT_ID=""
 SETUP_AZURE=0
 LOCAL=0
 NO_SERVICE=0
+OVERLAY=0
 UNINSTALL=0
 PURGE=0
 
@@ -42,6 +47,7 @@ while [ $# -gt 0 ]; do
         --setup-azure) SETUP_AZURE=1; shift ;;
         --local) LOCAL=1; shift ;;
         --no-service) NO_SERVICE=1; shift ;;
+        --with-dolphin-overlay) OVERLAY=1; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
         --purge) PURGE=1; shift ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -60,6 +66,11 @@ if [ "$UNINSTALL" = 1 ]; then
     rm -f "$BIN_DIR/onedrive-daemon" "$BIN_DIR/odctl" "$BIN_DIR/onedrive-flyout"
     rm -f "$UNIT_DIR/$SERVICE" "$MENU_DIR/onedrive.desktop"
     rm -f "$APP_DIR/onedrive-linux.desktop" "$ICON_DIR/onedrive-linux.svg"
+    rm -f "$ICON_DIR/onedrive-cloud.svg" "$ICON_DIR/onedrive-partial.svg" \
+          "$ICON_DIR/onedrive-upload.svg"
+    if [ -n "${QT_PLUGIN_DIR:-}" ] && [ -f "$QT_PLUGIN_DIR/kf6/overlayicon/onedrive-overlay.so" ]; then
+        sudo rm -f "$QT_PLUGIN_DIR/kf6/overlayicon/onedrive-overlay.so" || true
+    fi
     update-desktop-database "$APP_DIR" 2>/dev/null || true
     systemctl --user daemon-reload 2>/dev/null || true
     if [ "$PURGE" = 1 ]; then
@@ -210,12 +221,23 @@ if [ -f "$CONFIG_DIR/config.toml" ]; then
     [ -n "$CONFIGURED" ] && SYNC_DIR="${CONFIGURED/#\~/$HOME}"
 fi
 
-if [ "$LOCAL" = 1 ] && [ -f assets/onedrive-linux.svg ]; then
-    cp assets/onedrive-linux.svg "$ICON_DIR/onedrive-linux.svg"
-else
-    curl -fsSL "https://raw.githubusercontent.com/$REPO/main/assets/onedrive-linux.svg" \
-        -o "$ICON_DIR/onedrive-linux.svg" || warn "Could not fetch the app icon."
-fi
+fetch_asset() {
+    # $1 = path within the repo, $2 = destination
+    if [ "$LOCAL" = 1 ] && [ -f "$1" ]; then
+        cp "$1" "$2"
+    else
+        curl -fsSL "https://raw.githubusercontent.com/$REPO/main/$1" -o "$2" \
+            || warn "Could not fetch $1."
+    fi
+}
+
+fetch_asset assets/onedrive-linux.svg "$ICON_DIR/onedrive-linux.svg"
+# Overlay emblems for the Dolphin plugin. Installed unconditionally: they are
+# tiny, and a plugin that loads while its icons are missing draws nothing at
+# all, which is indistinguishable from the plugin not working.
+for emblem in onedrive-cloud onedrive-partial onedrive-upload; do
+    fetch_asset "assets/icons/$emblem.svg" "$ICON_DIR/$emblem.svg"
+done
 
 cat > "$APP_DIR/onedrive-linux.desktop" <<EOF
 [Desktop Entry]
@@ -258,6 +280,87 @@ EOF
 update-desktop-database "$APP_DIR" 2>/dev/null || true
 gtk-update-icon-cache -qtf "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" 2>/dev/null || true
 ok "Application launcher installed — search for \"OneDrive\" in your app menu"
+
+# ── Dolphin sync-state overlay plugin (opt-in) ───────────────────────────────
+# C++ against KDE Frameworks 6, so it is not built unless asked for. Every
+# failure here is non-fatal: the overlay is a nicety, and aborting the install
+# over it would leave the user with no working sync client at all.
+if [ "$OVERLAY" = 1 ]; then
+    say "Building the Dolphin overlay plugin…"
+
+    overlay_give_up() {
+        warn "Skipping the Dolphin overlay plugin: $1"
+        echo "     Everything else is installed and working."
+        echo "     See extensions/dolphin/README.md to build it by hand later."
+        OVERLAY=0
+    }
+
+    # Qt only searches the plugin directories in its own library paths — a
+    # plugin under $HOME is silently never loaded. Install where Dolphin looks.
+    QT_PLUGIN_DIR=""
+    for qtpaths in qtpaths6 qtpaths; do
+        if command -v "$qtpaths" >/dev/null 2>&1; then
+            QT_PLUGIN_DIR=$("$qtpaths" --plugin-dir 2>/dev/null) && break
+        fi
+    done
+
+    if [ -z "$QT_PLUGIN_DIR" ]; then
+        overlay_give_up "could not determine the Qt plugin directory (is qtpaths6 installed?)"
+    fi
+fi
+
+if [ "$OVERLAY" = 1 ]; then
+    if ! command -v cmake >/dev/null 2>&1 || ! command -v g++ >/dev/null 2>&1; then
+        say "Installing build dependencies…"
+        if command -v pacman >/dev/null 2>&1; then
+            sudo pacman -S --needed --noconfirm base-devel cmake extra-cmake-modules kio qt6-base \
+                || warn "Dependency install failed — continuing anyway."
+        elif command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get install -y build-essential cmake extra-cmake-modules \
+                libkf6kio-dev qt6-base-dev || warn "Dependency install failed — continuing anyway."
+        elif command -v dnf >/dev/null 2>&1; then
+            sudo dnf install -y gcc-c++ cmake extra-cmake-modules kf6-kio-devel qt6-qtbase-devel \
+                || warn "Dependency install failed — continuing anyway."
+        else
+            overlay_give_up "unknown distribution; install cmake, extra-cmake-modules and the KF6 KIO development package yourself"
+        fi
+    fi
+fi
+
+if [ "$OVERLAY" = 1 ]; then
+    # Sources: the working tree with --local, otherwise the release tarball,
+    # which ships extensions/ for exactly this.
+    if [ "$LOCAL" = 1 ]; then
+        OVERLAY_SRC="$PWD/extensions/dolphin"
+    else
+        OVERLAY_SRC="$SRC/extensions/dolphin"
+    fi
+
+    if [ ! -f "$OVERLAY_SRC/CMakeLists.txt" ]; then
+        overlay_give_up "plugin sources not found at $OVERLAY_SRC"
+    fi
+fi
+
+if [ "$OVERLAY" = 1 ]; then
+    OVERLAY_BUILD=$(mktemp -d)
+    if cmake -S "$OVERLAY_SRC" -B "$OVERLAY_BUILD" \
+             -DCMAKE_BUILD_TYPE=Release \
+             -DKDE_INSTALL_PLUGINDIR="$QT_PLUGIN_DIR" >/dev/null 2>&1 \
+       && cmake --build "$OVERLAY_BUILD" -j"$(nproc)" >/dev/null 2>&1; then
+        if sudo cmake --install "$OVERLAY_BUILD" >/dev/null 2>&1; then
+            ok "Dolphin overlay plugin installed to $QT_PLUGIN_DIR/kf6/overlayicon"
+            echo "     Restart Dolphin to see sync-state emblems: kquitapp6 dolphin"
+        else
+            overlay_give_up "could not install to $QT_PLUGIN_DIR (needs sudo)"
+        fi
+    else
+        warn "The overlay plugin failed to build. Re-run these to see why:"
+        echo "     cmake -S $OVERLAY_SRC -B /tmp/od-overlay -DKDE_INSTALL_PLUGINDIR=$QT_PLUGIN_DIR"
+        echo "     cmake --build /tmp/od-overlay"
+        echo "     Everything else is installed and working."
+    fi
+    rm -rf "$OVERLAY_BUILD"
+fi
 
 # ── Config ───────────────────────────────────────────────────────────────────
 write_config() {

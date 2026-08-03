@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Overlay emblem: folder holds a mix of downloaded and cloud-only items.
+       A half-filled cloud reads as "some of this is here" at emblem size,
+       where a more literal composition would turn to mush. -->
+  <defs>
+    <clipPath id="left-half"><rect x="0" y="0" width="8" height="16"/></clipPath>
+  </defs>
+  <path d="M4.6 12.4a3.3 3.3 0 0 1-.35-6.58 4.5 4.5 0 0 1 8.46-1.05 3.05 3.05 0 0 1 .32 6.06l-.18.01z"
+        fill="#12181F" fill-opacity=".55" transform="translate(0,.6)"/>
+  <path d="M4.6 12.4a3.3 3.3 0 0 1-.35-6.58 4.5 4.5 0 0 1 8.46-1.05 3.05 3.05 0 0 1 .32 6.06l-.18.01z"
+        fill="#E8EDF3" stroke="#12181F" stroke-opacity=".65" stroke-width=".9"/>
+  <path d="M4.6 12.4a3.3 3.3 0 0 1-.35-6.58 4.5 4.5 0 0 1 8.46-1.05 3.05 3.05 0 0 1 .32 6.06l-.18.01z"
+        fill="#5AA2DD" clip-path="url(#left-half)"/>
+</svg>
