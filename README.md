@@ -13,6 +13,7 @@ A native OneDrive client for Linux featuring:
 - **Pin / unpin** — keep chosen files or folders always on device, or free space back to cloud-only
 - **Download integrity** — every download is verified against the server's QuickXorHash
 - **Dolphin overlay icons** — sync-state emblems in KDE's file manager (see `extensions/dolphin/`)
+- **Installs as a desktop app** — an entry in the application menu and KRunner, a tray icon, and autostart at login; the terminal is never required after install
 - **Status flyout** — left-click the tray icon for a window with live status, storage usage, and recent activity; expired sign-ins are fixed in two clicks with a graphical device-code flow
 - **`odctl`** CLI for status, pause/resume, pinning, forced sync, and re-authentication
 
@@ -276,7 +277,9 @@ crates/
 
 **FUSE mount fails** — ensure `fuse3` is installed and your user can access `/dev/fuse` (add to `fuse` group or use `allow_other` in FUSE options).
 
-**"connect to daemon via D-Bus"** — the daemon must be running before using `odctl`. Start it with `systemctl --user start onedrive-linux.service`.
+**"connect to daemon via D-Bus"** — the daemon must be running before using `odctl`. Start it with `systemctl --user start onedrive-linux.service`, or just open the OneDrive app from your application menu — it starts the service itself.
+
+**No "OneDrive" entry in the application menu** — some desktops cache the menu. Run `update-desktop-database ~/.local/share/applications` and log out and back in. Verify the entry exists at `~/.local/share/applications/onedrive-linux.desktop`.
 
 **Rate limiting** — the Graph API enforces per-user rate limits. The client respects `Retry-After` headers automatically.
 

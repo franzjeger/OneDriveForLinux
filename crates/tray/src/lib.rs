@@ -113,8 +113,12 @@ impl OneDriveTray {
 
 impl Tray for OneDriveTray {
     fn activate(&mut self, _x: i32, _y: i32) {
-        // Left click opens the status flyout window.
-        let _ = std::process::Command::new("onedrive-flyout").spawn();
+        // Left click opens the status flyout window. --flyout asks it to
+        // behave like a panel popup (dismiss when focus is lost) rather than
+        // like the ordinary window the application menu launches.
+        let _ = std::process::Command::new("onedrive-flyout")
+            .arg("--flyout")
+            .spawn();
     }
 
     fn id(&self) -> String {

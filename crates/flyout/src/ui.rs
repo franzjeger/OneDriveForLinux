@@ -14,6 +14,10 @@ const MUTED: Color32 = Color32::from_rgb(0x8E, 0x9C, 0xAC);
 
 const REFRESH: Duration = Duration::from_secs(2);
 
+/// How long the window says "Starting…" after asking systemd to launch the
+/// daemon, before admitting it did not come up.
+const STARTUP_GRACE: Duration = Duration::from_secs(15);
+
 enum View {
     Status,
     /// Device-code sign-in: message, user code, verification URL.
@@ -32,6 +36,14 @@ pub struct FlyoutApp {
     /// Set once the compositor has granted focus — see the dismissal logic in
     /// `update`.
     has_been_focused: bool,
+    /// True when opened from the tray icon (`--flyout`), where clicking
+    /// elsewhere should dismiss the window. Launched from the application menu
+    /// it is an ordinary window and must stay put until closed.
+    dismiss_on_blur: bool,
+    /// Set when the daemon was not running and we asked systemd to start it,
+    /// so the window says "Starting…" for a grace period instead of the more
+    /// alarming "Daemon not running".
+    starting_since: Option<Instant>,
 }
 
 impl FlyoutApp {
@@ -40,6 +52,13 @@ impl FlyoutApp {
             style.spacing.item_spacing.y = 8.0;
         });
         let client = DaemonClient::connect();
+        // Opening the app is how most people will start syncing, so bring the
+        // service up rather than telling them to run systemctl.
+        let starting = if client.reachable() {
+            false
+        } else {
+            client.start_daemon()
+        };
         let snap = client.fetch();
         let mut app = Self {
             client,
@@ -47,6 +66,8 @@ impl FlyoutApp {
             last_fetch: Instant::now(),
             view: View::Status,
             has_been_focused: false,
+            starting_since: starting.then(Instant::now),
+            dismiss_on_blur: std::env::args().any(|a| a == "--flyout"),
         };
         // `onedrive-flyout --signin` (used by the tray's "Sign in" action)
         // jumps straight into the sign-in flow.
@@ -69,7 +90,10 @@ impl FlyoutApp {
     fn headline(&self) -> (Color32, String) {
         let s = &self.snap;
         if !s.reachable {
-            (MUTED, "Daemon not running".into())
+            match self.starting_since {
+                Some(t) if t.elapsed() < STARTUP_GRACE => (ACCENT, "Starting…".into()),
+                _ => (MUTED, "Daemon not running".into()),
+            }
         } else if s.paused {
             (WARN, "Paused".into())
         } else if s.needs_auth {
@@ -301,6 +325,9 @@ Sync resumes automatically.",
         // before it has granted focus — closing on that would make the window
         // appear and vanish immediately. Only arm the dismissal once focus has
         // actually been held at least once.
+        if !self.dismiss_on_blur {
+            return;
+        }
         if ctx.input(|i| i.viewport().focused == Some(true)) {
             self.has_been_focused = true;
         } else if self.has_been_focused && ctx.input(|i| i.viewport().focused == Some(false)) {
