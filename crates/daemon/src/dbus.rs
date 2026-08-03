@@ -65,6 +65,12 @@ impl OneDriveInterface {
         Ok(self.progress.lock().clone())
     }
 
+    /// How many uploads are queued for retry. Non-zero means edits exist that
+    /// have not reached OneDrive yet.
+    async fn pending_uploads(&self) -> zbus::fdo::Result<u32> {
+        Ok(self.engine.pending_uploads().await as u32)
+    }
+
     /// True when the daemon is waiting for the user to re-authenticate.
     async fn needs_auth(&self) -> zbus::fdo::Result<bool> {
         Ok(self.needs_auth.load(std::sync::atomic::Ordering::Relaxed))

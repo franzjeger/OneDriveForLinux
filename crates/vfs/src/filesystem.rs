@@ -860,7 +860,37 @@ impl Filesystem for OneDriveFS {
                                     );
                                 }
                                 Err(e) => {
-                                    error!("upload failed for {}: {e}", item.name);
+                                    // Do not let the edit disappear: queue it
+                                    // for retry. The engine drains the queue
+                                    // with backoff, and the entry survives a
+                                    // daemon restart because it lives in the DB.
+                                    error!(
+                                        "upload failed for {}: {e} — queued for retry",
+                                        item.name
+                                    );
+                                    let pending = sync_engine::PendingUpload {
+                                        item_id: item.id.clone(),
+                                        parent_id: parent_id.clone(),
+                                        name: item.name.clone(),
+                                        source_path: cache_path.clone(),
+                                        attempts: 1,
+                                        next_attempt: chrono::Utc::now()
+                                            + sync_engine::retry_delay(1),
+                                        last_error: Some(e.to_string()),
+                                    };
+                                    if let Err(e) = db.enqueue_upload(&pending).await {
+                                        error!(
+                                            "could not queue {} for retry: {e} — this edit may be lost",
+                                            item.name
+                                        );
+                                    } else if let Err(e) =
+                                        db.set_sync_state(&item.id, &SyncState::LocalOnly).await
+                                    {
+                                        error!(
+                                            "could not mark {} as pending upload: {e}",
+                                            item.name
+                                        );
+                                    }
                                 }
                             }
                         }

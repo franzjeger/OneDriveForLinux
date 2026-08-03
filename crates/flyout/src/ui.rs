@@ -127,6 +127,13 @@ impl FlyoutApp {
             (WARN, "Paused".into())
         } else if s.needs_auth {
             (WARN, "Sign in required".into())
+        } else if s.pending_uploads > 0 {
+            // Outranks the progress line: unsent edits are the one thing the
+            // user might act on.
+            (
+                WARN,
+                format!("{} file(s) waiting to upload", s.pending_uploads),
+            )
         } else if s.errors > 0 {
             (BAD, format!("Needs attention · {} errors", s.errors))
         } else if !s.progress.is_empty() {

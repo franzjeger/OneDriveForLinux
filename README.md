@@ -15,6 +15,9 @@ A native OneDrive client for Linux featuring:
 - **Dolphin overlay icons** — sync-state emblems in KDE's file manager (see `extensions/dolphin/`)
 - **Installs as a desktop app** — an entry in the application menu and KRunner, a tray icon, and autostart at login; the terminal is never required after install
 - **Status flyout** — left-click the tray icon for a window with live status, storage usage, and recent activity; expired sign-ins are fixed in two clicks with a graphical device-code flow
+- **Uploads are never dropped** — a failed upload is queued in the database, retried with backoff, and survives a daemon restart; you are notified only if it is given up on
+- **Desktop notifications** for the three things that need you: sign-in expired, an upload given up on, a conflicting edit set aside
+- **Offline is not an error** — the tray says "Offline, waiting for a connection" instead of showing a failure you cannot act on
 - **Graphical settings** — sync folder, Files On-Demand, poll interval, sign-in method and exclusions, edited in the app and applied with a restart; no hand-editing TOML
 - **`odctl`** CLI for status, pause/resume, pinning, forced sync, and re-authentication
 
@@ -279,6 +282,8 @@ crates/
 **FUSE mount fails** — ensure `fuse3` is installed and your user can access `/dev/fuse` (add to `fuse` group or use `allow_other` in FUSE options).
 
 **"connect to daemon via D-Bus"** — the daemon must be running before using `odctl`. Start it with `systemctl --user start onedrive-linux.service`, or just open the OneDrive app from your application menu — it starts the service itself.
+
+**"You are not authorized to execute this file"** when using the OneDrive right-click menu in Dolphin — Plasma refuses to run a service menu whose `.desktop` file is not executable. Fix it with `chmod +x ~/.local/share/kio/servicemenus/onedrive.desktop`, or re-run the installer (v0.5.1 and later set the bit).
 
 **No "OneDrive" entry in the application menu** — some desktops cache the menu. Run `update-desktop-database ~/.local/share/applications` and log out and back in. Verify the entry exists at `~/.local/share/applications/onedrive-linux.desktop`.
 

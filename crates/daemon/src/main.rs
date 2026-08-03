@@ -1,4 +1,5 @@
 mod dbus;
+mod notify;
 
 use anyhow::{Context, Result};
 use fuse3::{raw::Session, MountOptions};
@@ -216,6 +217,12 @@ async fn main() -> Result<()> {
             None
         }
     };
+
+    // ── Desktop notifications ──────────────────────────────────────────────────
+    // Reuses the session bus connection we already hold.
+    if let Some(conn) = &_dbus_conn {
+        notify::spawn(conn.clone(), engine.subscribe());
+    }
 
     // ── Signal handling ────────────────────────────────────────────────────────
     let mut signals = Signals::new([SIGTERM, SIGINT]).context("register signals")?;

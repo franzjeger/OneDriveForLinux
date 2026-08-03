@@ -28,6 +28,8 @@ use tracing::{debug, error, info, warn};
 mod delta;
 mod local;
 mod pin;
+mod uploads;
+pub use uploads::retry_delay;
 
 pub struct SyncEngine {
     config: Arc<Config>,
@@ -140,6 +142,13 @@ impl SyncEngine {
             });
         }
 
+        // Upload retry queue — drains failed uploads regardless of mode, since
+        // both the FUSE write path and the local watcher feed it.
+        let engine_uploads = Arc::clone(&self);
+        tokio::spawn(async move {
+            engine_uploads.upload_retry_loop().await;
+        });
+
         info!("SyncEngine started");
         Ok(())
     }
@@ -147,16 +156,39 @@ impl SyncEngine {
     // ── Remote polling loop ────────────────────────────────────────────────────
 
     async fn remote_watcher_loop(self: Arc<Self>) {
+        // Only announce a connectivity change, not every poll while it holds.
+        let mut offline = false;
         loop {
             if !self.is_paused().await {
-                if let Err(e) = self.run_delta_sync().await {
-                    error!("Delta sync error: {e}");
-                    if self.is_auth_error(&e) {
-                        error!("Authentication failed — pausing sync. Run `onedrive-linux auth` to re-authenticate.");
-                        self.pause().await;
-                        let _ = self.event_tx.send(SyncEvent::AuthRequired);
-                    } else {
-                        let _ = self.event_tx.send(SyncEvent::Error(e.to_string()));
+                match self.run_delta_sync().await {
+                    Ok(()) => {
+                        if offline {
+                            info!("Network is back — resuming normal polling");
+                            offline = false;
+                            let _ = self.event_tx.send(SyncEvent::BackOnline);
+                        }
+                    }
+                    Err(e) if Self::is_offline_error(&e) => {
+                        // Being offline is not a fault to report: there is
+                        // nothing for the user to fix and it resolves itself.
+                        if !offline {
+                            warn!("Network unreachable — sync will resume automatically");
+                            offline = true;
+                            let _ = self.event_tx.send(SyncEvent::Offline);
+                        } else {
+                            debug!("Still offline: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        error!("Delta sync error: {e}");
+                        offline = false;
+                        if self.is_auth_error(&e) {
+                            error!("Authentication failed — pausing sync. Run `onedrive-linux auth` to re-authenticate.");
+                            self.pause().await;
+                            let _ = self.event_tx.send(SyncEvent::AuthRequired);
+                        } else {
+                            let _ = self.event_tx.send(SyncEvent::Error(e.to_string()));
+                        }
                     }
                 }
             }
@@ -165,6 +197,15 @@ impl SyncEngine {
             ))
             .await;
         }
+    }
+
+    /// Returns true if the error is "the network is not reachable" rather than
+    /// a real failure — a DNS failure, a refused connection, or a timeout.
+    pub(crate) fn is_offline_error(e: &anyhow::Error) -> bool {
+        let Some(GraphError::Http(req)) = e.downcast_ref::<GraphError>() else {
+            return false;
+        };
+        req.is_connect() || req.is_timeout()
     }
 
     /// Returns true if the error is an authentication/authorization failure.
