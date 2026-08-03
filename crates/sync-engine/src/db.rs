@@ -666,6 +666,19 @@ impl Database {
         .await
     }
 
+    /// Forget a folder's delta token, forcing the next sync to be a full one.
+    pub async fn clear_delta_link(&self, folder_id: &str) -> Result<()> {
+        let folder_id = folder_id.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "DELETE FROM delta_links WHERE folder_id = ?1",
+                params![folder_id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn get_delta_link(&self, folder_id: &str) -> Result<Option<String>> {
         let folder_id = folder_id.to_string();
         self.with_conn(move |conn| {

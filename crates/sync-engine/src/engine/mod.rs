@@ -12,7 +12,7 @@ use crate::{
 };
 use chrono::Utc;
 use dashmap::DashMap;
-use graph_client::{AuthManager, DriveItem, GraphClient, GraphError};
+use graph_client::{AuthManager, DeltaResponse, DriveItem, GraphClient, GraphError};
 use std::{
     path::Path,
     path::PathBuf,

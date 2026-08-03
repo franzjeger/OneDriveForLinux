@@ -29,6 +29,12 @@ pub enum GraphError {
     #[error("Upload session error: {0}")]
     UploadSession(String),
 
+    /// Graph invalidated our delta token (HTTP 410 `resyncRequired`). The
+    /// stored deltaLink must be discarded and the sync restarted from scratch;
+    /// retrying the same link loops forever.
+    #[error("Delta token expired — a full resync is required")]
+    ResyncRequired,
+
     #[error("Rate limited, retry after {retry_after_secs}s")]
     RateLimited { retry_after_secs: u64 },
 }
