@@ -95,8 +95,14 @@ else
     command -v curl >/dev/null 2>&1 || die "curl is required."
     if [ -z "$VERSION" ]; then
         say "Finding latest release…"
-        VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-            | grep -m1 '"tag_name"' | cut -d'"' -f4)
+        # Capture first, then parse: piping into an early-exiting reader
+        # (grep -m1 / head) SIGPIPEs curl, and with `set -e -o pipefail` that
+        # aborts the whole script mid-download.
+        release_json=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest") \
+            || die "Could not reach GitHub to look up the latest release."
+        VERSION=$(printf '%s' "$release_json" \
+            | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            | sed -n '1p')
         [ -n "$VERSION" ] || die "Could not determine the latest release."
     fi
     say "Downloading OneDrive for Linux $VERSION…"
@@ -189,6 +195,10 @@ client_id = "$1"
 # tenant_id = "common"
 # sync_dir = "~/OneDrive"
 # on_demand = true
+# How to sign in: "auto" | "browser" | "device_code".
+# Use "browser" if Conditional Access blocks device code (AADSTS53003);
+# the app registration then needs http://localhost as a redirect URI.
+# auth_method = "auto"
 EOF
     ok "Config written to $CONFIG_DIR/config.toml"
 }
@@ -220,6 +230,12 @@ fi
 # The daemon prints the device code — and, with --setup-azure, walks through
 # creating the app registration first. It is stopped again once tokens land.
 if [ ! -f "$CONFIG_DIR/tokens.json" ] && [ "$NO_SERVICE" = 0 ] && [ -r /dev/tty ]; then
+    # Only one daemon may run at a time, so stop the service while we sign in.
+    if systemctl --user is-active --quiet "$SERVICE" 2>/dev/null; then
+        say "Stopping the running service so we can sign in…"
+        systemctl --user stop "$SERVICE" || true
+        sleep 1
+    fi
     if [ "$SETUP_AZURE" = 1 ]; then
         say "Setting up Azure and signing in — follow the prompts below."
         WAIT_SECS=900
@@ -239,7 +255,14 @@ if [ ! -f "$CONFIG_DIR/tokens.json" ] && [ "$NO_SERVICE" = 0 ] && [ -r /dev/tty 
     sleep 2   # let the first delta sync start before we stop it
     kill -TERM "$DAEMON_PID" 2>/dev/null || true
     wait "$DAEMON_PID" 2>/dev/null || true
-    [ -f "$CONFIG_DIR/tokens.json" ] || die "Sign-in did not complete — re-run the installer to try again."
+    if [ ! -f "$CONFIG_DIR/tokens.json" ]; then
+        warn "Sign-in did not complete."
+        echo "     If Microsoft reported AADSTS53003, your tenant's Conditional Access"
+        echo "     blocks the device code flow. Add 'auth_method = \"browser\"' to"
+        echo "     $CONFIG_DIR/config.toml and register http://localhost as a redirect"
+        echo "     URI on the app, then re-run this installer."
+        die "Aborting — nothing was started."
+    fi
     ok "Signed in"
 fi
 
