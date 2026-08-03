@@ -3,6 +3,7 @@
 //! Reads everything over the daemon's D-Bus interface; owns no sync logic.
 
 mod daemon;
+mod settings;
 mod ui;
 
 fn main() -> eframe::Result {
@@ -10,7 +11,9 @@ fn main() -> eframe::Result {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([380.0, 470.0])
             .with_min_inner_size([340.0, 380.0])
-            .with_resizable(false)
+            // The settings view is taller than the status view; let people
+            // size the window rather than scroll a cramped panel.
+            .with_resizable(true)
             .with_title("OneDrive")
             // Must match the basename of onedrive-linux.desktop, or Wayland
             // compositors show the window with a generic icon and refuse to

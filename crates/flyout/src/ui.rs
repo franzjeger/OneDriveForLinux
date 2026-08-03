@@ -3,6 +3,7 @@
 //! and a three-button action row.
 
 use crate::daemon::{human_bytes, relative_time, DaemonClient, Snapshot};
+use crate::settings::{self, Settings, AUTH_METHODS};
 use eframe::egui::{self, Color32, RichText, Rounding};
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,14 @@ const STARTUP_GRACE: Duration = Duration::from_secs(15);
 
 enum View {
     Status,
+    /// Editing config.toml through real controls rather than a text editor.
+    Settings {
+        draft: Settings,
+        /// What the file held when the view opened — used to detect edits.
+        original: Settings,
+        /// Result banner shown after a save attempt.
+        status: Option<Result<String, String>>,
+    },
     /// Device-code sign-in: message, user code, verification URL.
     SignIn {
         user_code: String,
@@ -73,8 +82,28 @@ impl FlyoutApp {
         // jumps straight into the sign-in flow.
         if std::env::args().any(|a| a == "--signin") {
             app.begin_sign_in();
+        } else if std::env::args().any(|a| a == "--settings") {
+            app.open_settings();
         }
         app
+    }
+
+    fn open_settings(&mut self) {
+        let loaded = settings::load();
+        let (draft, status) = match loaded {
+            Ok(s) => (s, None),
+            // A config we cannot parse must not be silently replaced with
+            // defaults — that would throw away the user's client_id.
+            Err(e) => (
+                Settings::default(),
+                Some(Err(format!("Could not read the config file: {e}"))),
+            ),
+        };
+        self.view = View::Settings {
+            original: draft.clone(),
+            draft,
+            status,
+        };
     }
 
     fn begin_sign_in(&mut self) {
@@ -205,10 +234,177 @@ Sync resumes automatically.",
             return;
         }
 
+        if let View::Settings {
+            draft,
+            original,
+            status,
+        } = &mut self.view
+        {
+            let mut close = false;
+            let mut save = false;
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("‹ Back").clicked() {
+                        close = true;
+                    }
+                    ui.label(RichText::new("Settings").strong().size(16.0));
+                });
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .max_height(ui.available_height() - 46.0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("SYNC FOLDER")
+                                .size(10.5)
+                                .color(MUTED)
+                                .strong(),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut draft.sync_dir)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.label(
+                            RichText::new("Where your OneDrive files appear on this computer.")
+                                .color(MUTED)
+                                .size(11.0),
+                        );
+                        ui.add_space(6.0);
+
+                        ui.checkbox(&mut draft.on_demand, "Files On-Demand");
+                        ui.label(
+                            RichText::new(
+                                "Show every file without downloading it. Files download when \
+                                 you open them. Turn this off to keep everything on disk.",
+                            )
+                            .color(MUTED)
+                            .size(11.0),
+                        );
+                        ui.add_space(6.0);
+
+                        ui.label(
+                            RichText::new("CHECK FOR CHANGES")
+                                .size(10.5)
+                                .color(MUTED)
+                                .strong(),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut draft.poll_interval_secs, 10..=600)
+                                .suffix(" s")
+                                .text("interval"),
+                        );
+                        ui.add_space(6.0);
+
+                        ui.label(
+                            RichText::new("SIGN-IN METHOD")
+                                .size(10.5)
+                                .color(MUTED)
+                                .strong(),
+                        );
+                        for (id, label) in AUTH_METHODS {
+                            ui.radio_value(&mut draft.auth_method, id.to_string(), label);
+                        }
+                        ui.label(
+                            RichText::new(
+                                "Choose Browser sign-in if your organisation blocks the device \
+                                 code flow (error AADSTS53003).",
+                            )
+                            .color(MUTED)
+                            .size(11.0),
+                        );
+                        ui.add_space(6.0);
+
+                        ui.label(RichText::new("EXCLUDE").size(10.5).color(MUTED).strong());
+                        ui.add(
+                            egui::TextEdit::multiline(&mut draft.excluded_patterns)
+                                .desired_rows(4)
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "One glob pattern per line. These files are never synced.",
+                            )
+                            .color(MUTED)
+                            .size(11.0),
+                        );
+                        ui.add_space(6.0);
+
+                        if ui.link("Open config.toml in a text editor").clicked() {
+                            let _ = std::process::Command::new("xdg-open")
+                                .arg(settings::config_path())
+                                .spawn();
+                        }
+
+                        if let Some(result) = status {
+                            ui.add_space(6.0);
+                            match result {
+                                Ok(msg) => {
+                                    ui.label(RichText::new(msg.as_str()).color(GOOD).size(12.0))
+                                }
+                                Err(msg) => {
+                                    ui.label(RichText::new(msg.as_str()).color(BAD).size(12.0))
+                                }
+                            };
+                        }
+                    });
+
+                egui::TopBottomPanel::bottom("settings_actions")
+                    .frame(egui::Frame::none().inner_margin(egui::Margin::symmetric(0.0, 8.0)))
+                    .show_inside(ui, |ui| {
+                        ui.separator();
+                        let changed = draft != original;
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(changed, egui::Button::new("Save & restart"))
+                                .clicked()
+                            {
+                                save = true;
+                            }
+                            if ui
+                                .add_enabled(changed, egui::Button::new("Discard"))
+                                .clicked()
+                            {
+                                *draft = original.clone();
+                                *status = None;
+                            }
+                            if !changed {
+                                ui.label(RichText::new("No changes").color(MUTED).size(11.5));
+                            }
+                        });
+                    });
+            });
+
+            if save {
+                // Saving alone changes nothing: the daemon reads the config
+                // once at startup, so it has to be restarted to pick it up.
+                *status = Some(match settings::save(draft) {
+                    Ok(()) if settings::restart_daemon() => {
+                        *original = draft.clone();
+                        Ok("Saved — OneDrive restarted with the new settings.".into())
+                    }
+                    Ok(()) => {
+                        *original = draft.clone();
+                        Err(
+                            "Saved, but OneDrive could not be restarted. Restart it yourself \
+                             for the changes to take effect."
+                                .into(),
+                        )
+                    }
+                    Err(e) => Err(format!("Could not save: {e}")),
+                });
+            }
+            if close {
+                self.view = View::Status;
+            }
+            return;
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             // ── Header ────────────────────────────────────────────────
             let (color, text) = self.headline();
             let mut sign_in_clicked = false;
+            let mut settings_clicked = false;
             ui.horizontal(|ui| {
                 ui.label(RichText::new("☁").size(24.0).color(ACCENT));
                 ui.vertical(|ui| {
@@ -311,13 +507,14 @@ Sync resumes automatically.",
                             self.snap = self.client.fetch();
                         }
                         if cols[2].button("Settings").clicked() {
-                            let cfg = dirs::config_dir()
-                                .unwrap_or_default()
-                                .join("onedrive-linux/config.toml");
-                            let _ = std::process::Command::new("xdg-open").arg(cfg).spawn();
+                            settings_clicked = true;
                         }
                     });
                 });
+
+            if settings_clicked {
+                self.open_settings();
+            }
         });
 
         // Flyout behavior: dismiss when the user clicks elsewhere. Under Wayland
