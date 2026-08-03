@@ -18,6 +18,20 @@ A native OneDrive client for Linux featuring:
 
 ---
 
+## Quick Install
+
+One command downloads the latest release, verifies it, installs the binaries, systemd service, and Dolphin menu, walks you through sign-in, and starts syncing:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/franzjeger/OneDriveForLinux/main/install.sh | bash
+```
+
+You'll need an Azure app client ID the first time (Step 1 below). Uninstall with `install.sh --uninstall` (add `--purge` to also remove config and sign-in).
+
+The manual steps below do the same thing, for those who prefer it.
+
+---
+
 ## Prerequisites
 
 ```bash
