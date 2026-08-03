@@ -167,6 +167,14 @@ impl GraphClient {
                             // failure reason — include it for diagnosability.
                             let reason = resp.status().canonical_reason().unwrap_or("unknown");
                             let body = resp.text().await.unwrap_or_default();
+                            // 410 Gone with code "resyncRequired" means our
+                            // delta token is no longer valid. Surface it as its
+                            // own error so the caller can drop the token and
+                            // start over, rather than retrying it forever.
+                            if status == 410 && body.contains("resyncRequired") {
+                                warn!("Delta token invalidated by Graph — full resync required");
+                                return Err(GraphError::ResyncRequired);
+                            }
                             let body: String = body.chars().take(512).collect();
                             return Err(GraphError::Api {
                                 status,
@@ -751,6 +759,55 @@ mod http_tests {
         assert_eq!(
             resp.delta_link.as_deref(),
             Some("https://example/delta?token=final")
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_delta_token_surfaces_as_resync_required() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        Mock::given(method("GET"))
+            .and(path("/me/drive/items/root/delta"))
+            .respond_with(ResponseTemplate::new(410).set_body_json(serde_json::json!({
+                "error": {
+                    "code": "resyncRequired",
+                    "message": "Resync required. Replace any local items with the server's version."
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), dir.path());
+        let err = client
+            .get_delta(
+                "root",
+                Some(&format!("{}/me/drive/items/root/delta", server.uri())),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, GraphError::ResyncRequired),
+            "expected ResyncRequired, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_410s_are_not_treated_as_resync_required() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        Mock::given(method("GET"))
+            .and(path("/me/drive/items/root/delta"))
+            .respond_with(ResponseTemplate::new(410).set_body_json(serde_json::json!({
+                "error": {"code": "itemNotFound", "message": "Gone for good."}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), dir.path());
+        let err = client.get_delta("root", None).await.unwrap_err();
+        assert!(
+            !matches!(err, GraphError::ResyncRequired),
+            "an unrelated 410 must not trigger a full resync"
         );
     }
 

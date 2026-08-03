@@ -10,6 +10,9 @@ use tracing::info;
 
 const MAX_RECENT: usize = 5;
 
+/// Longest error text shown in the tray menu/tooltip before truncation.
+const MAX_ERROR_CHARS: usize = 90;
+
 const ICON_IDLE: &str = "folder-cloud";
 const ICON_SYNCING: &str = "emblem-synchronizing";
 const ICON_ERROR: &str = "dialog-error";
@@ -49,7 +52,7 @@ impl TrayStatus {
         match self {
             TrayStatus::Idle => "OneDrive — Up to date".into(),
             TrayStatus::Syncing => "OneDrive — Syncing…".into(),
-            TrayStatus::Error(e) => format!("OneDrive — Error: {e}"),
+            TrayStatus::Error(e) => format!("OneDrive — Error: {}", short_error(e)),
             TrayStatus::Paused => "OneDrive — Paused".into(),
             TrayStatus::AuthRequired => "OneDrive — Sign in required".into(),
         }
@@ -58,6 +61,22 @@ impl TrayStatus {
     fn is_paused(&self) -> bool {
         matches!(self, TrayStatus::Paused)
     }
+}
+
+/// Graph errors carry the full JSON body for the log. Pasting that into a menu
+/// item makes the tray unreadable, so keep the first sentence and cap it.
+fn short_error(e: &str) -> String {
+    let first_line = e.lines().next().unwrap_or(e).trim();
+    // Cut at the JSON body if there is one — the prose before it is the useful part.
+    let prose = first_line
+        .split_once(": {")
+        .map(|(before, _)| before)
+        .unwrap_or(first_line);
+    let mut out: String = prose.chars().take(MAX_ERROR_CHARS).collect();
+    if prose.chars().count() > MAX_ERROR_CHARS {
+        out.push('…');
+    }
+    out
 }
 
 /// Shared tray state behind a Mutex so ksni callbacks can access it.
@@ -440,4 +459,44 @@ pub fn spawn_tray(
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_error_strips_the_json_body() {
+        let raw = "API error 410: Gone: {\"error\":{\"code\":\"resyncRequired\",\"message\":\"Resync required. Replace any local items with the server's version\"}}";
+        let short = short_error(raw);
+        assert!(!short.contains('{'), "JSON body leaked into {short:?}");
+        assert!(short.starts_with("API error 410: Gone"));
+    }
+
+    #[test]
+    fn short_error_caps_long_prose() {
+        let short = short_error(&"x".repeat(500));
+        assert!(short.chars().count() <= MAX_ERROR_CHARS + 1);
+        assert!(short.ends_with('…'));
+    }
+
+    #[test]
+    fn progress_replaces_the_generic_syncing_line() {
+        let mut st = TrayState::new("/sync".into(), "/cfg".into());
+        st.status = TrayStatus::Syncing;
+        assert_eq!(st.status_line(), "OneDrive — Syncing…");
+        st.detail = Some("Fetching file list… 1200 items".into());
+        assert_eq!(
+            st.status_line(),
+            "OneDrive — Fetching file list… 1200 items"
+        );
+    }
+
+    #[test]
+    fn progress_does_not_leak_into_other_states() {
+        let mut st = TrayState::new("/sync".into(), "/cfg".into());
+        st.detail = Some("Fetching file list… 1200 items".into());
+        st.status = TrayStatus::Paused;
+        assert_eq!(st.status_line(), "OneDrive — Paused");
+    }
 }

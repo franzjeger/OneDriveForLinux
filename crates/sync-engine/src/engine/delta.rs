@@ -3,6 +3,22 @@
 use super::*;
 
 impl SyncEngine {
+    /// One delta fetch, reporting page progress on the event channel.
+    async fn fetch_delta(
+        &self,
+        folder_id: &str,
+        delta_link: Option<&str>,
+    ) -> Result<DeltaResponse, GraphError> {
+        let tx = self.event_tx.clone();
+        self.graph
+            .get_delta_with_progress(folder_id, delta_link, move |_page, items| {
+                let _ = tx.send(SyncEvent::SyncProgress(format!(
+                    "Fetching file list… {items} items"
+                )));
+            })
+            .await
+    }
+
     pub(super) async fn run_delta_sync(&self) -> anyhow::Result<()> {
         info!("Delta sync: fetching drive root");
         let root = self.graph.get_drive_root().await?;
@@ -10,7 +26,7 @@ impl SyncEngine {
         info!("Delta sync: root id = {folder_id}");
 
         let delta_link = self.db.get_delta_link(&folder_id).await?;
-        let was_full_sync = delta_link.is_none();
+        let mut was_full_sync = delta_link.is_none();
 
         if was_full_sync {
             info!("Delta sync: first run — fetching the full file list, this can take a while");
@@ -21,15 +37,23 @@ impl SyncEngine {
             warn!("Failed to send SyncStarted event: {e}");
         }
 
-        let tx = self.event_tx.clone();
-        let response = self
-            .graph
-            .get_delta_with_progress(&folder_id, delta_link.as_deref(), move |_page, items| {
-                let _ = tx.send(SyncEvent::SyncProgress(format!(
-                    "Fetching file list… {items} items"
-                )));
-            })
-            .await?;
+        let mut response = self.fetch_delta(&folder_id, delta_link.as_deref()).await;
+
+        // Graph expires delta tokens (a mailbox move, a long gap, a service-side
+        // change) and answers 410 resyncRequired. The stored token is dead, so
+        // retrying it would fail identically forever — drop it and start over.
+        if matches!(response, Err(GraphError::ResyncRequired)) {
+            warn!("Delta token rejected by Graph (resyncRequired) — starting a full resync");
+            let _ = self.event_tx.send(SyncEvent::SyncProgress(
+                "Rebuilding the file list…".to_string(),
+            ));
+            if let Err(e) = self.db.clear_delta_link(&folder_id).await {
+                warn!("Failed to clear the stale delta link: {e}");
+            }
+            was_full_sync = true;
+            response = self.fetch_delta(&folder_id, None).await;
+        }
+        let response = response?;
 
         info!(
             "Delta sync: got {} items, delta_link={}",
