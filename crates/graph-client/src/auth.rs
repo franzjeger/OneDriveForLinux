@@ -11,6 +11,10 @@ const OAUTH_SCOPE: &str = "Files.ReadWrite.All offline_access User.Read";
 
 const DEVICE_CODE_ENDPOINT: &str =
     "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/devicecode";
+const AUTHORIZE_ENDPOINT: &str = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize";
+
+/// How long the browser sign-in waits for the redirect before giving up.
+const BROWSER_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Persisted token set saved to disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +154,109 @@ impl AuthManager {
         self.save_token(ts).await?;
         info!("Re-authentication successful");
         Ok(())
+    }
+
+    /// Sign in through the system browser using the authorization code flow
+    /// with PKCE (RFC 7636).
+    ///
+    /// Preferred over the device code flow: many tenants block device code
+    /// via Conditional Access (AADSTS53003), and this flow also carries
+    /// device signals the way a normal browser sign-in does. Requires
+    /// `http://localhost` as a redirect URI on the app registration under
+    /// "Mobile and desktop applications" — Azure accepts any port there.
+    pub async fn authenticate_browser(&self) -> Result<()> {
+        let ts = self
+            .run_browser_flow(|url, _| {
+                println!("\nOpening your browser to sign in…");
+                println!("If it doesn't open, paste this into a browser:\n{url}\n");
+                let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+            })
+            .await?;
+        self.save_token(ts).await?;
+        info!("Browser authentication successful");
+        Ok(())
+    }
+
+    /// Browser sign-in, notifying `on_url` with (auth_url, redirect_uri) once
+    /// the local listener is up — callers decide how to present it.
+    pub async fn run_browser_flow<F>(&self, on_url: F) -> Result<TokenSet>
+    where
+        F: FnOnce(&str, &str),
+    {
+        use crate::pkce;
+
+        let verifier = pkce::random_token()?;
+        let challenge = pkce::code_challenge(&verifier);
+        let state = pkce::random_token()?;
+
+        // Port 0 → the OS picks a free port; Azure allows any port on
+        // http://localhost for public clients.
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").context("bind local redirect listener")?;
+        let port = listener.local_addr()?.port();
+        let redirect_uri = format!("http://localhost:{port}");
+
+        let auth_url = format!(
+            "{}?client_id={}&response_type=code&redirect_uri={}&response_mode=query\
+             &scope={}&state={}&code_challenge={}&code_challenge_method=S256",
+            AUTHORIZE_ENDPOINT.replace("{tenant}", &self.tenant_id),
+            pkce::encode_param(&self.client_id),
+            pkce::encode_param(&redirect_uri),
+            pkce::encode_param(OAUTH_SCOPE),
+            pkce::encode_param(&state),
+            pkce::encode_param(&challenge),
+        );
+
+        on_url(&auth_url, &redirect_uri);
+
+        let code = tokio::task::spawn_blocking(move || {
+            pkce::wait_for_redirect(listener, &state, BROWSER_AUTH_TIMEOUT)
+        })
+        .await
+        .context("redirect listener task")??;
+
+        debug!("Received authorization code, exchanging for tokens");
+        let url = TOKEN_ENDPOINT.replace("{tenant}", &self.tenant_id);
+        let params = [
+            ("client_id", self.client_id.as_str()),
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("code_verifier", verifier.as_str()),
+            ("scope", OAUTH_SCOPE),
+        ];
+        let resp = self.http.post(&url).form(&params).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Token exchange failed ({status}): {body}");
+        }
+        let tr: TokenResponse = resp.json().await?;
+        Ok(TokenSet {
+            access_token: tr.access_token,
+            refresh_token: tr.refresh_token,
+            expires_at: Utc::now() + Duration::seconds(tr.expires_in),
+            token_type: tr.token_type,
+            scope: tr.scope,
+        })
+    }
+
+    /// Sign in with the best available method: the browser when a graphical
+    /// session is present (unless `prefer_browser` says otherwise), falling
+    /// back to the device code flow on headless machines.
+    pub async fn authenticate_interactive(&self, prefer_browser: Option<bool>) -> Result<()> {
+        let has_display =
+            std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some();
+        let use_browser = prefer_browser.unwrap_or(has_display);
+
+        if use_browser {
+            match self.authenticate_browser().await {
+                Ok(()) => return Ok(()),
+                Err(e) if prefer_browser == Some(true) => return Err(e),
+                Err(e) => warn!("Browser sign-in failed ({e}) — falling back to device code"),
+            }
+        }
+        self.authenticate_device_code().await
     }
 
     async fn request_device_code(&self) -> Result<DeviceCodeResponse> {

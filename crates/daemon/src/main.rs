@@ -89,10 +89,10 @@ async fn main() -> Result<()> {
     );
 
     if !auth.is_authenticated().await {
-        info!("No saved tokens — starting device code flow");
-        auth.authenticate_device_code()
+        info!("No saved tokens — starting interactive sign-in");
+        auth.authenticate_interactive(config.auth_preference())
             .await
-            .context("device code authentication")?;
+            .context("interactive authentication")?;
     }
 
     // ── Database ───────────────────────────────────────────────────────────────
