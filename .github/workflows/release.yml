@@ -42,7 +42,10 @@ jobs:
           cp config/systemd/onedrive-linux.service deploy.sh install.sh README.md "$DIST/"
           # --local installs the launcher icon from ./assets, so ship it.
           mkdir -p "$DIST/assets"
-          cp assets/onedrive-linux.svg "$DIST/assets/"
+          cp -r assets/. "$DIST/assets/"
+          # --with-dolphin-overlay compiles from these.
+          mkdir -p "$DIST/extensions"
+          cp -r extensions/. "$DIST/extensions/"
           tar czf "$DIST.tar.gz" "$DIST"
           sha256sum "$DIST.tar.gz" > "$DIST.tar.gz.sha256"
 

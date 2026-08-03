@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Overlay emblem: edited locally, not yet uploaded. The FUSE layer serves
+       this state as "local"; without an icon for it the files that most need
+       attention would carry no marking at all. -->
+  <circle cx="8" cy="8" r="6.6" fill="#12181F" fill-opacity=".55" transform="translate(0,.6)"/>
+  <circle cx="8" cy="8" r="6.6" fill="#CFA04A" stroke="#12181F" stroke-opacity=".65" stroke-width=".9"/>
+  <path d="M8 4.6l3.1 3.3H9.3v3.6H6.7V7.9H4.9z" fill="#12181F" fill-opacity=".85"/>
+</svg>

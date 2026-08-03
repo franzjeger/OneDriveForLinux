@@ -242,7 +242,12 @@ private:
                                   Q_ARG(QStringList, paths));
     }
 
-    // Map sync state string → KDE overlay icon name(s).
+    // Map sync state string -> KDE overlay icon name(s).
+    //
+    // The states are exactly those served by the FUSE layer in
+    // crates/vfs/src/filesystem.rs; every one of them must appear here, or
+    // files in that state silently carry no marking at all. The onedrive-*
+    // icons are shipped by the installer into the hicolor theme.
     static QStringList overlaysForState(const QString &state)
     {
         if (state == QLatin1String("synced")) {
@@ -256,6 +261,9 @@ private:
             return {QStringLiteral("onedrive-cloud")};
         } else if (state == QLatin1String("partial")) {
             return {QStringLiteral("onedrive-partial")};
+        } else if (state == QLatin1String("local")) {
+            // Edited here, not yet uploaded — the state most worth seeing.
+            return {QStringLiteral("onedrive-upload")};
         } else if (state == QLatin1String("error")) {
             return {QStringLiteral("vcs-conflicting")};
         } else if (state == QLatin1String("conflict")) {
