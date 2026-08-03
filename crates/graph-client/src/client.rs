@@ -39,6 +39,10 @@ const LARGE_FILE_THRESHOLD: u64 = 4 * 1024 * 1024; // 4 MB
 /// Chunk size for upload sessions (must be multiple of 320 KiB per Graph API).
 const UPLOAD_CHUNK_SIZE: usize = 10 * 320 * 1024; // ~3.2 MB
 /// Maximum number of retries for transient failures.
+/// Items requested per delta page. Graph defaults to roughly 200; asking for
+/// the documented maximum keeps a first full sync to far fewer round trips.
+const DELTA_PAGE_SIZE: u32 = 1000;
+
 const MAX_RETRIES: u32 = 3;
 /// Base delay for exponential backoff (doubles each retry).
 const RETRY_BASE_DELAY_SECS: u64 = 2;
@@ -234,13 +238,34 @@ impl GraphClient {
         folder_id: &str,
         delta_link: Option<&str>,
     ) -> GraphResult<DeltaResponse> {
+        self.get_delta_with_progress(folder_id, delta_link, |_, _| {})
+            .await
+    }
+
+    /// As [`get_delta`], reporting `(page, items_so_far)` after each page so
+    /// callers can show progress during a long first sync.
+    pub async fn get_delta_with_progress<F>(
+        &self,
+        folder_id: &str,
+        delta_link: Option<&str>,
+        on_page: F,
+    ) -> GraphResult<DeltaResponse>
+    where
+        F: Fn(u32, usize),
+    {
         let url = match delta_link {
             Some(link) => link.to_string(),
             // No $select — omitting it ensures ALL facets (folder, file, deleted,
             // remoteItem, etc.) are returned reliably. With $select the Graph API
             // sometimes silently drops facets like `folder` for delta responses,
             // causing folders to be misidentified as files.
-            None => format!("{}/me/drive/items/{folder_id}/delta", self.base_url),
+            // $top raises the page size from Graph's ~200 default, cutting the
+            // number of sequential round trips on a first full sync by ~5x.
+            // Graph carries it through into @odata.nextLink automatically.
+            None => format!(
+                "{}/me/drive/items/{folder_id}/delta?$top={DELTA_PAGE_SIZE}",
+                self.base_url
+            ),
         };
 
         debug!("delta url: {url}");
@@ -289,6 +314,7 @@ impl GraphClient {
                     " (last page)"
                 }
             );
+            on_page(page, all_items.len());
 
             if let Some(next) = next_link {
                 current_url = next;

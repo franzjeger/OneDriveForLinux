@@ -381,6 +381,20 @@ impl Database {
 
     // ── Pin / unpin ────────────────────────────────────────────────────────────
 
+    /// IDs of every pinned item. Loading these once lets a delta pass decide
+    /// pinned-vs-placeholder without a per-item DB round trip.
+    pub async fn pinned_ids(&self) -> Result<std::collections::HashSet<String>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare("SELECT id FROM items WHERE pinned = 1")?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(ids)
+        })
+        .await
+    }
+
     /// Pin or unpin a single item by its OneDrive item ID.
     pub async fn set_pinned(&self, id: &str, pinned: bool) -> Result<()> {
         let id = id.to_string();
@@ -756,6 +770,22 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(by_path.id, "id1");
+    }
+
+    #[tokio::test]
+    async fn pinned_ids_returns_only_pinned_items() {
+        let (_dir, db) = open_temp_db();
+        db.upsert_item(&test_item("plain", "/sync/a.txt"))
+            .await
+            .unwrap();
+        db.upsert_item(&test_item("kept", "/sync/b.txt"))
+            .await
+            .unwrap();
+        db.set_pinned("kept", true).await.unwrap();
+
+        let pinned = db.pinned_ids().await.unwrap();
+        assert_eq!(pinned.len(), 1);
+        assert!(pinned.contains("kept"));
     }
 
     #[tokio::test]

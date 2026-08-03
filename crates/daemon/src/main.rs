@@ -157,14 +157,22 @@ async fn main() -> Result<()> {
     // without the engine knowing anything about UIs.
     let recent: dbus::RecentBuffer = Arc::new(parking_lot::Mutex::new(Default::default()));
     let needs_auth = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let progress: dbus::ProgressText = Arc::new(parking_lot::Mutex::new(String::new()));
     {
         use std::sync::atomic::Ordering;
         let mut rx = engine.subscribe();
         let recent = Arc::clone(&recent);
         let needs_auth = Arc::clone(&needs_auth);
+        let progress = Arc::clone(&progress);
         tokio::spawn(async move {
             while let Ok(event) = rx.recv().await {
                 match event {
+                    sync_engine::SyncEvent::SyncProgress(msg) => {
+                        *progress.lock() = msg;
+                    }
+                    sync_engine::SyncEvent::SyncCompleted => {
+                        progress.lock().clear();
+                    }
                     sync_engine::SyncEvent::ItemStateChanged { path, state } => {
                         let mut buf = recent.lock();
                         let entry = (
@@ -184,6 +192,7 @@ async fn main() -> Result<()> {
                     // A successful re-auth resumes sync.
                     sync_engine::SyncEvent::Resumed | sync_engine::SyncEvent::SyncStarted => {
                         needs_auth.store(false, Ordering::Relaxed);
+                        progress.lock().clear();
                     }
                     _ => {}
                 }
@@ -197,6 +206,7 @@ async fn main() -> Result<()> {
         Arc::clone(&graph),
         Arc::clone(&recent),
         Arc::clone(&needs_auth),
+        Arc::clone(&progress),
     )
     .await
     {

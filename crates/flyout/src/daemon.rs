@@ -17,6 +17,7 @@ pub trait OneDriveControl {
     fn pause(&self) -> zbus::Result<()>;
     fn resume(&self) -> zbus::Result<()>;
     fn needs_auth(&self) -> zbus::Result<bool>;
+    fn get_progress(&self) -> zbus::Result<String>;
     fn start_auth(&self) -> zbus::Result<(String, String, String)>;
 }
 
@@ -31,6 +32,8 @@ pub struct Snapshot {
     pub errors: usize,
     pub quota_used: u64,
     pub quota_total: u64,
+    /// Live progress line from the engine, empty when no pass is running.
+    pub progress: String,
     /// (file name, parent dir, state, unix seconds)
     pub recent: Vec<(String, String, String, i64)>,
 }
@@ -59,6 +62,7 @@ impl DaemonClient {
             reachable: true,
             paused: proxy.is_paused().unwrap_or(false),
             needs_auth: proxy.needs_auth().unwrap_or(false),
+            progress: proxy.get_progress().unwrap_or_default(),
             total_items: items.len(),
             ..Default::default()
         };

@@ -21,9 +21,14 @@ impl SyncEngine {
             warn!("Failed to send SyncStarted event: {e}");
         }
 
+        let tx = self.event_tx.clone();
         let response = self
             .graph
-            .get_delta(&folder_id, delta_link.as_deref())
+            .get_delta_with_progress(&folder_id, delta_link.as_deref(), move |_page, items| {
+                let _ = tx.send(SyncEvent::SyncProgress(format!(
+                    "Fetching file list… {items} items"
+                )));
+            })
             .await?;
 
         info!(
@@ -34,6 +39,10 @@ impl SyncEngine {
 
         let had_items = !response.items.is_empty();
         let seen_ids = if had_items {
+            let _ = self.event_tx.send(SyncEvent::SyncProgress(format!(
+                "Processing {} changes…",
+                response.items.len()
+            )));
             self.handle_delta(response.items).await
         } else {
             std::collections::HashSet::new()
@@ -65,9 +74,25 @@ impl SyncEngine {
     /// Returns the set of item IDs seen (used for full-sync reconciliation).
     pub async fn handle_delta(&self, changes: Vec<DriveItem>) -> std::collections::HashSet<String> {
         let mut seen_ids = std::collections::HashSet::with_capacity(changes.len());
-        // Items that only need a DB record (outside sync_folders) are collected
-        // and written in a single transaction for a large performance gain.
+        // Items that only need a DB record (outside sync_folders, or on-demand
+        // placeholders) are collected and written in a single transaction. Doing
+        // this one-by-one costs an fsync per item, which dominates a first sync.
         let mut db_batch: Vec<DbItem> = Vec::new();
+
+        // In on-demand mode almost every item is a placeholder; the only reason
+        // to touch the DB per item is to check whether it's pinned. Pinned items
+        // are rare, so load their IDs once and batch everything else.
+        let pinned = if self.config.on_demand {
+            match self.db.pinned_ids().await {
+                Ok(ids) => Some(ids),
+                Err(e) => {
+                    warn!("Failed to load pinned IDs, falling back to per-item sync: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         for item in changes {
             seen_ids.insert(item.id.clone());
@@ -100,6 +125,28 @@ impl SyncEngine {
 
             if item.is_root() || item.is_remote_item() {
                 continue;
+            }
+
+            // On-demand, unpinned items are pure metadata: a folder row or a
+            // cloud-only placeholder. Neither touches the filesystem, so they
+            // can go straight into the batch.
+            if let Some(pinned) = &pinned {
+                if !pinned.contains(&item.id) {
+                    if let Ok(local_path) = self.item_local_path(&item) {
+                        let is_folder = item.is_folder();
+                        db_batch.push(self.drive_item_to_db(&item, &local_path, !is_folder));
+                        let state = if is_folder {
+                            SyncState::Synced
+                        } else {
+                            SyncState::CloudOnly
+                        };
+                        let _ = self.event_tx.send(SyncEvent::ItemStateChanged {
+                            path: local_path,
+                            state,
+                        });
+                        continue;
+                    }
+                }
             }
 
             // Items outside sync_folders need only a DB record — batch them.

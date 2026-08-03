@@ -29,6 +29,9 @@ pub struct FlyoutApp {
     snap: Snapshot,
     last_fetch: Instant,
     view: View,
+    /// Set once the compositor has granted focus — see the dismissal logic in
+    /// `update`.
+    has_been_focused: bool,
 }
 
 impl FlyoutApp {
@@ -43,6 +46,7 @@ impl FlyoutApp {
             snap,
             last_fetch: Instant::now(),
             view: View::Status,
+            has_been_focused: false,
         };
         // `onedrive-flyout --signin` (used by the tray's "Sign in" action)
         // jumps straight into the sign-in flow.
@@ -72,6 +76,10 @@ impl FlyoutApp {
             (WARN, "Sign in required".into())
         } else if s.errors > 0 {
             (BAD, format!("Needs attention · {} errors", s.errors))
+        } else if !s.progress.is_empty() {
+            // The engine's own words beat a counter — during the initial delta
+            // there is nothing to count yet, and silence reads as "stuck".
+            (ACCENT, s.progress.clone())
         } else if s.syncing > 0 {
             (ACCENT, format!("Syncing {} items…", s.syncing))
         } else {
@@ -288,8 +296,14 @@ Sync resumes automatically.",
                 });
         });
 
-        // Flyout behavior: dismiss when the user clicks elsewhere.
-        if ctx.input(|i| i.viewport().focused == Some(false)) {
+        // Flyout behavior: dismiss when the user clicks elsewhere. Under Wayland
+        // the compositor reports the window as unfocused for the first frames,
+        // before it has granted focus — closing on that would make the window
+        // appear and vanish immediately. Only arm the dismissal once focus has
+        // actually been held at least once.
+        if ctx.input(|i| i.viewport().focused == Some(true)) {
+            self.has_been_focused = true;
+        } else if self.has_been_focused && ctx.input(|i| i.viewport().focused == Some(false)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }

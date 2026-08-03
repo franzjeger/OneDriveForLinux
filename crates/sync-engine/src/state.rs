@@ -71,6 +71,8 @@ pub enum SyncEvent {
     ItemStateChanged { path: PathBuf, state: SyncState },
     /// Overall sync pass started.
     SyncStarted,
+    /// Human-readable progress during a long pass ("Fetching file list… 1200 items").
+    SyncProgress(String),
     /// Overall sync pass completed.
     SyncCompleted,
     /// Sync is paused.
