@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # OneDrive for Linux — one-command installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/franzjeger/OneDriveForLinux/main/install.sh | bash
+# Already have an Azure app registration (or an existing config):
+#   curl -fsSL .../install.sh | bash
+#   curl -fsSL .../install.sh | bash -s -- --client-id <YOUR-CLIENT-ID>
+#
+# No Azure app registration yet — set one up as part of the install:
+#   curl -fsSL .../install.sh | bash -s -- --setup-azure
 #
 # Options:
+#   --client-id <ID>   Use this Azure app client ID (skips the prompt)
+#   --setup-azure      Create the Azure app registration during install
 #   --version vX.Y.Z   Install a specific release (default: latest)
 #   --local            Install binaries from the current directory instead of downloading
 #   --no-service       Install files only; don't enable/start the systemd service
@@ -19,6 +26,8 @@ MENU_DIR="$HOME/.local/share/kio/servicemenus"
 CONFIG_DIR="$HOME/.config/onedrive-linux"
 
 VERSION=""
+CLIENT_ID=""
+SETUP_AZURE=0
 LOCAL=0
 NO_SERVICE=0
 UNINSTALL=0
@@ -27,6 +36,8 @@ PURGE=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --version) VERSION="$2"; shift 2 ;;
+        --client-id) CLIENT_ID="$2"; shift 2 ;;
+        --setup-azure) SETUP_AZURE=1; shift ;;
         --local) LOCAL=1; shift ;;
         --no-service) NO_SERVICE=1; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
@@ -171,35 +182,61 @@ EOF
 ok "Dolphin right-click menu installed"
 
 # ── Config ───────────────────────────────────────────────────────────────────
-if [ ! -f "$CONFIG_DIR/config.toml" ]; then
-    say "First-time setup — Azure app client ID needed."
-    echo "   (Create one at https://portal.azure.com → App registrations; see the README.)"
-    if [ -r /dev/tty ]; then
-        read -r -p "   Client ID: " CLIENT_ID < /dev/tty
-        [ -n "$CLIENT_ID" ] || die "A client ID is required."
-        mkdir -p "$CONFIG_DIR"
-        cat > "$CONFIG_DIR/config.toml" <<EOF
-client_id = "$CLIENT_ID"
+write_config() {
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_DIR/config.toml" <<EOF
+client_id = "$1"
 # tenant_id = "common"
 # sync_dir = "~/OneDrive"
 # on_demand = true
 EOF
-        ok "Config written to $CONFIG_DIR/config.toml"
+    ok "Config written to $CONFIG_DIR/config.toml"
+}
+
+if [ -f "$CONFIG_DIR/config.toml" ]; then
+    ok "Using existing config at $CONFIG_DIR/config.toml"
+elif [ -n "$CLIENT_ID" ]; then
+    write_config "$CLIENT_ID"
+elif [ "$SETUP_AZURE" = 1 ]; then
+    say "The daemon will guide you through creating the Azure app registration."
+elif [ -r /dev/tty ]; then
+    say "No configuration found — an Azure app registration is required."
+    echo "   1) I already have a client ID — paste it now"
+    echo "   2) Set one up for me (opens Azure; uses the az CLI when available)"
+    read -r -p "   Choice [1/2]: " CHOICE < /dev/tty
+    if [ "$CHOICE" = "2" ]; then
+        SETUP_AZURE=1
     else
-        warn "No terminal available — create $CONFIG_DIR/config.toml manually before starting."
-        NO_SERVICE=1
+        read -r -p "   Client ID: " CLIENT_ID < /dev/tty
+        [ -n "$CLIENT_ID" ] || die "A client ID is required (or re-run with --setup-azure)."
+        write_config "$CLIENT_ID"
     fi
+else
+    warn "No config and no terminal — re-run with --client-id <ID> or --setup-azure."
+    NO_SERVICE=1
 fi
 
-# ── Sign in (device code) ────────────────────────────────────────────────────
-if [ ! -f "$CONFIG_DIR/tokens.json" ] && [ -r /dev/tty ]; then
-    say "Signing in to Microsoft — a code will appear below."
-    "$BIN_DIR/onedrive-daemon" & DAEMON_PID=$!
-    for _ in $(seq 1 300); do
+# ── Sign in (and Azure setup, when requested) ────────────────────────────────
+# The daemon prints the device code — and, with --setup-azure, walks through
+# creating the app registration first. It is stopped again once tokens land.
+if [ ! -f "$CONFIG_DIR/tokens.json" ] && [ "$NO_SERVICE" = 0 ] && [ -r /dev/tty ]; then
+    if [ "$SETUP_AZURE" = 1 ]; then
+        say "Setting up Azure and signing in — follow the prompts below."
+        WAIT_SECS=900
+    else
+        say "Signing in to Microsoft — a code will appear below."
+        WAIT_SECS=300
+    fi
+    # stdin from the terminal so interactive prompts work; job control is off
+    # in this non-interactive shell, so the child shares our process group and
+    # may read the tty.
+    "$BIN_DIR/onedrive-daemon" < /dev/tty & DAEMON_PID=$!
+    for _ in $(seq 1 "$WAIT_SECS"); do
         [ -f "$CONFIG_DIR/tokens.json" ] && break
         kill -0 "$DAEMON_PID" 2>/dev/null || break
         sleep 1
     done
+    sleep 2   # let the first delta sync start before we stop it
     kill -TERM "$DAEMON_PID" 2>/dev/null || true
     wait "$DAEMON_PID" 2>/dev/null || true
     [ -f "$CONFIG_DIR/tokens.json" ] || die "Sign-in did not complete — re-run the installer to try again."
