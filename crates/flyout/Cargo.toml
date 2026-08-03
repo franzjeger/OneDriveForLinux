@@ -19,5 +19,6 @@ eframe = { version = "0.29", default-features = false, features = [
 ] }
 zbus = { version = "5", features = ["blocking-api"] }
 anyhow.workspace = true
+toml.workspace = true
 chrono.workspace = true
 dirs.workspace = true

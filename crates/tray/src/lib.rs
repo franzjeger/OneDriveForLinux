@@ -287,12 +287,20 @@ impl Tray for OneDriveTray {
         // Settings
         items.push(
             StandardItem {
-                label: "Settings (Edit Config)".into(),
+                label: "Settings…".into(),
                 icon_name: "preferences-system".into(),
                 activate: Box::new(move |_| {
-                    let _ = std::process::Command::new("xdg-open")
-                        .arg(config_path.as_os_str())
-                        .spawn();
+                    // The flyout has a real settings view. Fall back to opening
+                    // the raw file only if that binary is missing.
+                    if std::process::Command::new("onedrive-flyout")
+                        .arg("--settings")
+                        .spawn()
+                        .is_err()
+                    {
+                        let _ = std::process::Command::new("xdg-open")
+                            .arg(config_path.as_os_str())
+                            .spawn();
+                    }
                 }),
                 ..Default::default()
             }

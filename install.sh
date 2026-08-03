@@ -230,13 +230,19 @@ Keywords=onedrive;cloud;sync;microsoft;
 StartupNotify=true
 StartupWMClass=onedrive-linux
 SingleMainWindow=true
-Actions=OpenFolder;Signin;
+Actions=OpenFolder;Settings;Signin;
 
 [Desktop Action OpenFolder]
 Name=Open OneDrive folder
 Name[nb]=Åpne OneDrive-mappen
 Icon=folder-cloud
 Exec=xdg-open $SYNC_DIR
+
+[Desktop Action Settings]
+Name=Settings
+Name[nb]=Innstillinger
+Icon=preferences-system
+Exec=$BIN_DIR/onedrive-flyout --settings
 
 [Desktop Action Signin]
 Name=Sign in again

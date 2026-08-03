@@ -15,6 +15,7 @@ A native OneDrive client for Linux featuring:
 - **Dolphin overlay icons** — sync-state emblems in KDE's file manager (see `extensions/dolphin/`)
 - **Installs as a desktop app** — an entry in the application menu and KRunner, a tray icon, and autostart at login; the terminal is never required after install
 - **Status flyout** — left-click the tray icon for a window with live status, storage usage, and recent activity; expired sign-ins are fixed in two clicks with a graphical device-code flow
+- **Graphical settings** — sync folder, Files On-Demand, poll interval, sign-in method and exclusions, edited in the app and applied with a restart; no hand-editing TOML
 - **`odctl`** CLI for status, pause/resume, pinning, forced sync, and re-authentication
 
 ---
