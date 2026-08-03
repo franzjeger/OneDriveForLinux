@@ -465,6 +465,14 @@ impl SyncEngine {
         );
         tokio::fs::rename(local_path, &conflict_path).await?;
 
+        // Announce the conflict before downloading. Silently setting a copy of
+        // the user's work aside under a different name is exactly the kind of
+        // thing they need to be told about.
+        let _ = self.event_tx.send(SyncEvent::ItemStateChanged {
+            path: conflict_path.clone(),
+            state: SyncState::Conflict,
+        });
+
         // Download the remote version
         self.download_item(remote, local_path).await?;
         Ok(())

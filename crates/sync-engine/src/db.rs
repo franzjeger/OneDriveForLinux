@@ -29,6 +29,22 @@ pub struct DbItem {
     pub pinned: bool,
 }
 
+/// An upload that has not yet succeeded.
+#[derive(Debug, Clone)]
+pub struct PendingUpload {
+    /// OneDrive item ID (or a `_local_` placeholder for a not-yet-created item).
+    pub item_id: String,
+    pub parent_id: String,
+    pub name: String,
+    /// File holding the content to upload — the on-demand cache file.
+    pub source_path: PathBuf,
+    /// How many times we have tried and failed.
+    pub attempts: u32,
+    /// Earliest time to try again.
+    pub next_attempt: DateTime<Utc>,
+    pub last_error: Option<String>,
+}
+
 /// Thread-safe SQLite wrapper.
 ///
 /// Uses `parking_lot::Mutex` instead of `std::sync::Mutex` to avoid mutex
@@ -91,6 +107,19 @@ impl Database {
              CREATE TABLE IF NOT EXISTS sync_excluded (
                  pattern TEXT PRIMARY KEY
              );
+
+             CREATE TABLE IF NOT EXISTS upload_queue (
+                 item_id      TEXT PRIMARY KEY,
+                 parent_id    TEXT NOT NULL,
+                 name         TEXT NOT NULL,
+                 source_path  TEXT NOT NULL,
+                 attempts     INTEGER NOT NULL DEFAULT 0,
+                 next_attempt TEXT NOT NULL,
+                 last_error   TEXT
+             );
+
+             CREATE INDEX IF NOT EXISTS idx_upload_queue_next
+                 ON upload_queue(next_attempt);
 
              CREATE TABLE IF NOT EXISTS local_symlinks (
                  parent_path TEXT NOT NULL,
@@ -373,6 +402,96 @@ impl Database {
             conn.execute(
                 "UPDATE items SET is_placeholder = ?1 WHERE id = ?2",
                 params![is_placeholder as i32, id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    // ── Upload queue ───────────────────────────────────────────────────────────
+
+    /// Record an upload that still has to happen (or has to be retried).
+    ///
+    /// Uploads are queued in the database rather than held in memory so a
+    /// failure survives a daemon restart: a file the user saved must not be
+    /// silently left un-uploaded because the network blipped.
+    pub async fn enqueue_upload(&self, entry: &PendingUpload) -> Result<()> {
+        let entry = entry.clone();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO upload_queue
+                     (item_id, parent_id, name, source_path, attempts, next_attempt, last_error)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)
+                 ON CONFLICT(item_id) DO UPDATE SET
+                     parent_id    = excluded.parent_id,
+                     name         = excluded.name,
+                     source_path  = excluded.source_path,
+                     attempts     = excluded.attempts,
+                     next_attempt = excluded.next_attempt,
+                     last_error   = excluded.last_error",
+                params![
+                    entry.item_id,
+                    entry.parent_id,
+                    entry.name,
+                    entry.source_path.to_string_lossy().as_ref(),
+                    entry.attempts as i64,
+                    entry.next_attempt.to_rfc3339(),
+                    entry.last_error,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Uploads whose retry time has arrived, oldest first.
+    pub async fn due_uploads(&self, limit: usize) -> Result<Vec<PendingUpload>> {
+        let now = Utc::now().to_rfc3339();
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT item_id, parent_id, name, source_path, attempts, next_attempt, last_error
+                 FROM upload_queue
+                 WHERE next_attempt <= ?1
+                 ORDER BY next_attempt
+                 LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(params![now, limit as i64], |row| {
+                    Ok(PendingUpload {
+                        item_id: row.get(0)?,
+                        parent_id: row.get(1)?,
+                        name: row.get(2)?,
+                        source_path: PathBuf::from(row.get::<_, String>(3)?),
+                        attempts: row.get::<_, i64>(4)? as u32,
+                        next_attempt: row
+                            .get::<_, String>(5)?
+                            .parse::<DateTime<Utc>>()
+                            .unwrap_or_else(|_| Utc::now()),
+                        last_error: row.get(6)?,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// Number of uploads still waiting, for status reporting.
+    pub async fn pending_upload_count(&self) -> Result<usize> {
+        self.with_conn(move |conn| {
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM upload_queue", [], |r| r.get(0))?;
+            Ok(n as usize)
+        })
+        .await
+    }
+
+    pub async fn dequeue_upload(&self, item_id: &str) -> Result<()> {
+        let item_id = item_id.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "DELETE FROM upload_queue WHERE item_id = ?1",
+                params![item_id],
             )?;
             Ok(())
         })
@@ -783,6 +902,65 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(by_path.id, "id1");
+    }
+
+    fn pending(id: &str, attempts: u32, next: DateTime<Utc>) -> PendingUpload {
+        PendingUpload {
+            item_id: id.into(),
+            parent_id: "parent".into(),
+            name: format!("{id}.txt"),
+            source_path: PathBuf::from(format!("/cache/{id}")),
+            attempts,
+            next_attempt: next,
+            last_error: Some("boom".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_upload_is_returned_once_due() {
+        let (_dir, db) = open_temp_db();
+        db.enqueue_upload(&pending("a", 1, Utc::now() - chrono::Duration::seconds(1)))
+            .await
+            .unwrap();
+
+        let due = db.due_uploads(10).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].item_id, "a");
+        assert_eq!(due[0].attempts, 1);
+        assert_eq!(due[0].source_path, PathBuf::from("/cache/a"));
+    }
+
+    #[tokio::test]
+    async fn upload_scheduled_for_later_is_not_due_yet() {
+        let (_dir, db) = open_temp_db();
+        db.enqueue_upload(&pending("b", 1, Utc::now() + chrono::Duration::hours(1)))
+            .await
+            .unwrap();
+        assert!(db.due_uploads(10).await.unwrap().is_empty());
+        // ...but it is still counted as outstanding work.
+        assert_eq!(db.pending_upload_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn requeueing_updates_rather_than_duplicating() {
+        let (_dir, db) = open_temp_db();
+        let past = Utc::now() - chrono::Duration::seconds(1);
+        db.enqueue_upload(&pending("c", 1, past)).await.unwrap();
+        db.enqueue_upload(&pending("c", 4, past)).await.unwrap();
+
+        let due = db.due_uploads(10).await.unwrap();
+        assert_eq!(due.len(), 1, "one file must not occupy two queue slots");
+        assert_eq!(due[0].attempts, 4, "attempt count must not reset");
+    }
+
+    #[tokio::test]
+    async fn dequeue_removes_the_entry() {
+        let (_dir, db) = open_temp_db();
+        db.enqueue_upload(&pending("d", 1, Utc::now() - chrono::Duration::seconds(1)))
+            .await
+            .unwrap();
+        db.dequeue_upload("d").await.unwrap();
+        assert_eq!(db.pending_upload_count().await.unwrap(), 0);
     }
 
     #[tokio::test]

@@ -25,6 +25,9 @@ enum TrayStatus {
     Error(String),
     Paused,
     AuthRequired,
+    /// No network. Deliberately distinct from Error: nothing is wrong with the
+    /// app, there is nothing for the user to fix, and it resolves by itself.
+    Offline,
 }
 
 impl TrayStatus {
@@ -35,6 +38,7 @@ impl TrayStatus {
             TrayStatus::Error(_) => IconState::Error,
             TrayStatus::Paused => IconState::Paused,
             TrayStatus::AuthRequired => IconState::AuthRequired,
+            TrayStatus::Offline => IconState::Paused,
         }
     }
 
@@ -45,6 +49,7 @@ impl TrayStatus {
             TrayStatus::Error(_) => ICON_ERROR,
             TrayStatus::Paused => ICON_PAUSED,
             TrayStatus::AuthRequired => ICON_ERROR,
+            TrayStatus::Offline => ICON_PAUSED,
         }
     }
 
@@ -55,6 +60,7 @@ impl TrayStatus {
             TrayStatus::Error(e) => format!("OneDrive — Error: {}", short_error(e)),
             TrayStatus::Paused => "OneDrive — Paused".into(),
             TrayStatus::AuthRequired => "OneDrive — Sign in required".into(),
+            TrayStatus::Offline => "OneDrive — Offline, waiting for a connection".into(),
         }
     }
 
@@ -458,6 +464,20 @@ pub fn spawn_tray(
                 }
                 SyncEvent::AuthRequired => {
                     st.status = TrayStatus::AuthRequired;
+                }
+                SyncEvent::Offline => {
+                    if !matches!(st.status, TrayStatus::Paused | TrayStatus::AuthRequired) {
+                        st.status = TrayStatus::Offline;
+                        st.detail = None;
+                    }
+                }
+                SyncEvent::BackOnline => {
+                    if matches!(st.status, TrayStatus::Offline) {
+                        st.status = TrayStatus::Idle;
+                    }
+                }
+                SyncEvent::UploadFailed { name, error } => {
+                    st.status = TrayStatus::Error(format!("Could not upload {name}: {error}"));
                 }
             }
             drop(st);

@@ -6,8 +6,8 @@ pub mod state;
 pub mod watcher;
 
 pub use config::Config;
-pub use db::{Database, DbItem};
-pub use engine::SyncEngine;
+pub use db::{Database, DbItem, PendingUpload};
+pub use engine::{retry_delay, SyncEngine};
 pub use quickxor::QuickXorHash;
 pub use state::{SyncEvent, SyncState};
 pub use watcher::LocalWatcher;

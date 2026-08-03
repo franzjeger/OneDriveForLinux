@@ -83,6 +83,14 @@ pub enum SyncEvent {
     Error(String),
     /// Authentication required.
     AuthRequired,
+    /// An upload was retried to exhaustion and has been given up on. Carries
+    /// enough to tell the user which file, since this may cost them an edit.
+    UploadFailed { name: String, error: String },
+    /// The network is unreachable — distinct from a genuine sync error, which
+    /// needs a different message and a different icon.
+    Offline,
+    /// Connectivity is back.
+    BackOnline,
 }
 
 #[cfg(test)]
