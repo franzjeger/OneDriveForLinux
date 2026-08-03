@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- App launcher icon. Palette matches the tray icons and the flyout:
+       accent #5AA2DD, cloud #E8EDF3, dark plate #12181F. -->
+  <defs>
+    <linearGradient id="plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1B2530"/>
+      <stop offset="1" stop-color="#12181F"/>
+    </linearGradient>
+    <linearGradient id="cloud" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#D7E2EE"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#plate)"/>
+  <rect x="2.75" y="2.75" width="58.5" height="58.5" rx="13.25"
+        fill="none" stroke="#5AA2DD" stroke-opacity=".35" stroke-width="1.5"/>
+
+  <!-- Cloud body -->
+  <path fill="url(#cloud)" d="M20.5 44.5a9.5 9.5 0 0 1-.9-18.96 13 13 0 0 1 24.4-3.02 8.75 8.75 0 0 1 .9 17.45l-.5.03z"/>
+
+  <!-- Sync arrows, drawn inside the cloud -->
+  <g fill="none" stroke="#5AA2DD" stroke-width="2.6" stroke-linecap="round">
+    <path d="M25.6 35.2a6.8 6.8 0 0 1 11.1-5.3"/>
+    <path d="M38.4 32.6a6.8 6.8 0 0 1-11.1 5.3"/>
+  </g>
+  <g fill="#5AA2DD">
+    <path d="M36.1 26.6l1.6 4.4-4.6-.5z"/>
+    <path d="M27.9 41.2l-1.6-4.4 4.6.5z"/>
+  </g>
+</svg>

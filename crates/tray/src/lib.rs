@@ -63,6 +63,9 @@ impl TrayStatus {
 /// Shared tray state behind a Mutex so ksni callbacks can access it.
 struct TrayState {
     status: TrayStatus,
+    /// Latest progress line from the engine ("Fetching file list… 1200 items").
+    /// Replaces the generic "Syncing…" text so a slow pass doesn't look hung.
+    detail: Option<String>,
     recent: VecDeque<(PathBuf, SyncState)>,
     sync_dir: PathBuf,
     config_path: PathBuf,
@@ -72,9 +75,18 @@ impl TrayState {
     fn new(sync_dir: PathBuf, config_path: PathBuf) -> Self {
         Self {
             status: TrayStatus::Idle,
+            detail: None,
             recent: VecDeque::with_capacity(MAX_RECENT),
             sync_dir,
             config_path,
+        }
+    }
+
+    /// Status text for the menu header and tooltip, preferring live progress.
+    fn status_line(&self) -> String {
+        match (&self.status, &self.detail) {
+            (TrayStatus::Syncing, Some(detail)) => format!("OneDrive — {detail}"),
+            (status, _) => status.tooltip(),
         }
     }
 
@@ -101,8 +113,12 @@ impl OneDriveTray {
 
 impl Tray for OneDriveTray {
     fn activate(&mut self, _x: i32, _y: i32) {
-        // Left click opens the status flyout window.
-        let _ = std::process::Command::new("onedrive-flyout").spawn();
+        // Left click opens the status flyout window. --flyout asks it to
+        // behave like a panel popup (dismiss when focus is lost) rather than
+        // like the ordinary window the application menu launches.
+        let _ = std::process::Command::new("onedrive-flyout")
+            .arg("--flyout")
+            .spawn();
     }
 
     fn id(&self) -> String {
@@ -128,7 +144,7 @@ impl Tray for OneDriveTray {
             icon_name: st.status.icon_name().to_string(),
             icon_pixmap: vec![],
             title: "OneDrive for Linux".into(),
-            description: st.status.tooltip(),
+            description: st.status_line(),
         }
     }
 
@@ -146,7 +162,7 @@ impl Tray for OneDriveTray {
         // Status header — the first thing the menu says is the app's state.
         let status_line = {
             let st = self.state.lock();
-            st.status.tooltip()
+            st.status_line()
         };
         items.push(
             StandardItem {
@@ -347,15 +363,53 @@ pub fn spawn_tray(
         service.spawn_without_dbus_name();
     });
 
+    // A full first sync emits an event per item. Pushing each one over D-Bus
+    // would swamp the panel, so events only mark the tray dirty and a ticker
+    // repaints at a human-visible rate.
+    let dirty = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    {
+        let dirty = Arc::clone(&dirty);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+            loop {
+                ticker.tick().await;
+                if dirty.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                    handle.update(|_| {});
+                }
+            }
+        });
+    }
+
     // Tokio task: receive sync events and update tray state
     tokio::spawn(async move {
-        while let Ok(event) = event_rx.recv().await {
+        loop {
+            let event = match event_rx.recv().await {
+                Ok(event) => event,
+                // Lagged: the engine outran us during a burst. State is
+                // rebuilt from later events, so keep going.
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    info!("Tray lagged {n} sync events");
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
             let mut st = state.lock();
             match event {
                 SyncEvent::SyncStarted => {
                     st.status = TrayStatus::Syncing;
+                    st.detail = None;
+                }
+                SyncEvent::SyncProgress(msg) => {
+                    // Progress implies a pass is running, even if SyncStarted
+                    // was missed (e.g. the tray attached mid-pass).
+                    if !matches!(st.status, TrayStatus::Paused) {
+                        st.status = TrayStatus::Syncing;
+                    }
+                    st.detail = Some(msg);
                 }
                 SyncEvent::SyncCompleted => {
+                    st.detail = None;
                     if !matches!(st.status, TrayStatus::Paused) {
                         st.status = TrayStatus::Idle;
                     }
@@ -380,7 +434,7 @@ pub fn spawn_tray(
                 }
             }
             drop(st);
-            handle.update(|_| {});
+            dirty.store(true, std::sync::atomic::Ordering::Release);
         }
         info!("Tray event loop exiting");
     });

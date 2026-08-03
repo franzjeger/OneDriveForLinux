@@ -9,11 +9,15 @@ use zbus::{fdo::RequestNameFlags, interface, Connection};
 /// Rolling buffer of recent item activity: (path, state, unix timestamp).
 pub type RecentBuffer = Arc<Mutex<VecDeque<(String, String, i64)>>>;
 
+/// Latest human-readable progress line from the engine, empty when idle.
+pub type ProgressText = Arc<Mutex<String>>;
+
 pub struct OneDriveInterface {
     pub engine: Arc<SyncEngine>,
     pub graph: Arc<GraphClient>,
     pub recent: RecentBuffer,
     pub needs_auth: Arc<std::sync::atomic::AtomicBool>,
+    pub progress: ProgressText,
 }
 
 #[interface(name = "com.onedrive.linux1")]
@@ -52,6 +56,13 @@ impl OneDriveInterface {
 
     async fn is_paused(&self) -> zbus::fdo::Result<bool> {
         Ok(self.engine.is_paused().await)
+    }
+
+    /// Current progress line ("Fetching file list… 1200 items"), or an empty
+    /// string when no pass is running. Lets the flyout say what is happening
+    /// during a long first sync instead of looking stalled.
+    async fn get_progress(&self) -> zbus::fdo::Result<String> {
+        Ok(self.progress.lock().clone())
     }
 
     /// True when the daemon is waiting for the user to re-authenticate.
@@ -121,6 +132,7 @@ pub async fn export_dbus(
     graph: Arc<GraphClient>,
     recent: RecentBuffer,
     needs_auth: Arc<std::sync::atomic::AtomicBool>,
+    progress: ProgressText,
 ) -> anyhow::Result<Connection> {
     let conn = Connection::session().await?;
     conn.object_server()
@@ -131,6 +143,7 @@ pub async fn export_dbus(
                 graph,
                 recent,
                 needs_auth,
+                progress,
             },
         )
         .await?;

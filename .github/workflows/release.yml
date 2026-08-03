@@ -40,6 +40,9 @@ jobs:
           mkdir -p "$DIST"
           cp target/release/onedrive-daemon target/release/odctl target/release/onedrive-flyout "$DIST/"
           cp config/systemd/onedrive-linux.service deploy.sh install.sh README.md "$DIST/"
+          # --local installs the launcher icon from ./assets, so ship it.
+          mkdir -p "$DIST/assets"
+          cp assets/onedrive-linux.svg "$DIST/assets/"
           tar czf "$DIST.tar.gz" "$DIST"
           sha256sum "$DIST.tar.gz" > "$DIST.tar.gz.sha256"
 

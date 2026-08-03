@@ -23,6 +23,8 @@ BIN_DIR="$HOME/.local/bin"
 UNIT_DIR="$HOME/.config/systemd/user"
 SERVICE="onedrive-linux.service"
 MENU_DIR="$HOME/.local/share/kio/servicemenus"
+APP_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+ICON_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps"
 CONFIG_DIR="$HOME/.config/onedrive-linux"
 
 VERSION=""
@@ -57,6 +59,8 @@ if [ "$UNINSTALL" = 1 ]; then
     systemctl --user disable --now "$SERVICE" 2>/dev/null || true
     rm -f "$BIN_DIR/onedrive-daemon" "$BIN_DIR/odctl" "$BIN_DIR/onedrive-flyout"
     rm -f "$UNIT_DIR/$SERVICE" "$MENU_DIR/onedrive.desktop"
+    rm -f "$APP_DIR/onedrive-linux.desktop" "$ICON_DIR/onedrive-linux.svg"
+    update-desktop-database "$APP_DIR" 2>/dev/null || true
     systemctl --user daemon-reload 2>/dev/null || true
     if [ "$PURGE" = 1 ]; then
         rm -rf "$CONFIG_DIR" \
@@ -187,6 +191,64 @@ Exec=odctl sync %f
 EOF
 ok "Dolphin right-click menu installed"
 
+# ── Application launcher entry ───────────────────────────────────────────────
+# This is what makes OneDrive a real app: an icon in the application menu and
+# in KRunner, so it never has to be started from a terminal.
+say "Installing application launcher…"
+mkdir -p "$APP_DIR" "$ICON_DIR"
+
+# Desktop entries have no field code for the home directory, so the folder
+# action needs a literal path. Honour a configured sync_dir when there is one.
+SYNC_DIR="$HOME/OneDrive"
+if [ -f "$CONFIG_DIR/config.toml" ]; then
+    CONFIGURED=$(sed -n 's/^[[:space:]]*sync_dir[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' \
+                 "$CONFIG_DIR/config.toml" | sed -n '1p')
+    [ -n "$CONFIGURED" ] && SYNC_DIR="${CONFIGURED/#\~/$HOME}"
+fi
+
+if [ "$LOCAL" = 1 ] && [ -f assets/onedrive-linux.svg ]; then
+    cp assets/onedrive-linux.svg "$ICON_DIR/onedrive-linux.svg"
+else
+    curl -fsSL "https://raw.githubusercontent.com/$REPO/main/assets/onedrive-linux.svg" \
+        -o "$ICON_DIR/onedrive-linux.svg" || warn "Could not fetch the app icon."
+fi
+
+cat > "$APP_DIR/onedrive-linux.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=OneDrive
+Name[nb]=OneDrive
+GenericName=Cloud file sync
+GenericName[nb]=Skysynkronisering
+Comment=Sync and browse your OneDrive files
+Comment[nb]=Synkroniser og bla i OneDrive-filene dine
+Exec=$BIN_DIR/onedrive-flyout
+Icon=onedrive-linux
+Terminal=false
+Categories=Network;FileTransfer;Utility;
+Keywords=onedrive;cloud;sync;microsoft;
+StartupNotify=true
+StartupWMClass=onedrive-linux
+SingleMainWindow=true
+Actions=OpenFolder;Signin;
+
+[Desktop Action OpenFolder]
+Name=Open OneDrive folder
+Name[nb]=Åpne OneDrive-mappen
+Icon=folder-cloud
+Exec=xdg-open $SYNC_DIR
+
+[Desktop Action Signin]
+Name=Sign in again
+Name[nb]=Logg inn på nytt
+Icon=dialog-password
+Exec=$BIN_DIR/onedrive-flyout --signin
+EOF
+
+update-desktop-database "$APP_DIR" 2>/dev/null || true
+gtk-update-icon-cache -qtf "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" 2>/dev/null || true
+ok "Application launcher installed — search for \"OneDrive\" in your app menu"
+
 # ── Config ───────────────────────────────────────────────────────────────────
 write_config() {
     mkdir -p "$CONFIG_DIR"
@@ -277,4 +339,7 @@ else
 fi
 
 echo
-ok "Done! Useful commands: odctl status · odctl pin <path> · left-click the tray icon"
+ok "Done! OneDrive starts automatically at login."
+echo "     Open it from your application menu (search for \"OneDrive\"), or"
+echo "     left-click the cloud icon in the system tray."
+echo "     Command line, if you want it: odctl status · odctl pin <path>"

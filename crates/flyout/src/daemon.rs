@@ -17,6 +17,7 @@ pub trait OneDriveControl {
     fn pause(&self) -> zbus::Result<()>;
     fn resume(&self) -> zbus::Result<()>;
     fn needs_auth(&self) -> zbus::Result<bool>;
+    fn get_progress(&self) -> zbus::Result<String>;
     fn start_auth(&self) -> zbus::Result<(String, String, String)>;
 }
 
@@ -31,9 +32,14 @@ pub struct Snapshot {
     pub errors: usize,
     pub quota_used: u64,
     pub quota_total: u64,
+    /// Live progress line from the engine, empty when no pass is running.
+    pub progress: String,
     /// (file name, parent dir, state, unix seconds)
     pub recent: Vec<(String, String, String, i64)>,
 }
+
+/// systemd user unit installed by install.sh.
+const SERVICE: &str = "onedrive-linux.service";
 
 pub struct DaemonClient {
     proxy: Option<OneDriveControlProxyBlocking<'static>>,
@@ -45,6 +51,28 @@ impl DaemonClient {
             .ok()
             .and_then(|conn| OneDriveControlProxyBlocking::new(&conn).ok());
         Self { proxy }
+    }
+
+    /// Ask systemd to start the background service.
+    ///
+    /// Launching the app from the desktop menu must not require the user to
+    /// have opened a terminal first, so the window brings its own daemon up.
+    /// The unit is `Type=simple`, so this returns as soon as the process is
+    /// forked; the D-Bus name lands a moment later and the UI's normal refresh
+    /// picks it up.
+    pub fn start_daemon(&self) -> bool {
+        std::process::Command::new("systemctl")
+            .args(["--user", "start", SERVICE])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Whether the daemon is currently answering on D-Bus.
+    pub fn reachable(&self) -> bool {
+        self.proxy
+            .as_ref()
+            .is_some_and(|proxy| proxy.is_paused().is_ok())
     }
 
     pub fn fetch(&self) -> Snapshot {
@@ -59,6 +87,7 @@ impl DaemonClient {
             reachable: true,
             paused: proxy.is_paused().unwrap_or(false),
             needs_auth: proxy.needs_auth().unwrap_or(false),
+            progress: proxy.get_progress().unwrap_or_default(),
             total_items: items.len(),
             ..Default::default()
         };
