@@ -20,13 +20,29 @@ A native OneDrive client for Linux featuring:
 
 ## Quick Install
 
-One command downloads the latest release, verifies it, installs the binaries, systemd service, and Dolphin menu, walks you through sign-in, and starts syncing:
+One command downloads the latest release, verifies its checksum, installs the binaries, systemd service, and Dolphin right-click menu, signs you in, and starts syncing. Pick the line that matches you:
+
+**A — you already have an Azure app registration** (or an existing `config.toml`):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/franzjeger/OneDriveForLinux/main/install.sh | bash
 ```
 
-You'll need an Azure app client ID the first time (Step 1 below). Uninstall with `install.sh --uninstall` (add `--purge` to also remove config and sign-in).
+It reuses your existing config, or asks for the client ID once. To skip the prompt entirely:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/franzjeger/OneDriveForLinux/main/install.sh | bash -s -- --client-id <YOUR-CLIENT-ID>
+```
+
+**B — you don't have an Azure app registration yet:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/franzjeger/OneDriveForLinux/main/install.sh | bash -s -- --setup-azure
+```
+
+This creates the app registration as part of the install — automatically via the `az` CLI if you're logged in as an admin, otherwise by opening the Azure portal and guiding you through it.
+
+Uninstall with `install.sh --uninstall` (add `--purge` to also remove config and sign-in).
 
 The manual steps below do the same thing, for those who prefer it.
 
