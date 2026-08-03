@@ -331,7 +331,11 @@ fi
 # ── Start ────────────────────────────────────────────────────────────────────
 if [ "$NO_SERVICE" = 0 ]; then
     say "Starting OneDrive…"
-    systemctl --user enable --now "$SERVICE"
+    # `enable --now` does nothing to an already-active unit, so re-running the
+    # installer to upgrade would leave the previous binary running. Enable for
+    # autostart, then restart unconditionally to pick up the new binaries.
+    systemctl --user enable "$SERVICE"
+    systemctl --user restart "$SERVICE"
     ok "OneDrive is running — look for the cloud icon in your system tray."
 else
     warn "Service not started (missing config or --no-service). Start later with:"
