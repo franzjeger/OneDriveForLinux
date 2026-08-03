@@ -24,3 +24,20 @@ fn main() -> eframe::Result {
         Box::new(|cc| Ok(Box::new(ui::FlyoutApp::new(cc)))),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    /// Guards the `default_fonts` feature on eframe. Without it egui embeds no
+    /// font data and every label in the window renders as nothing, while bars,
+    /// separators and button frames still draw — the window looks blank rather
+    /// than broken, which is very easy to misread as a daemon problem.
+    #[test]
+    fn egui_has_embedded_fonts() {
+        let fonts = eframe::egui::FontDefinitions::default();
+        assert!(
+            !fonts.font_data.is_empty(),
+            "egui was built without embedded fonts — add the `default_fonts` \
+             feature to the eframe dependency"
+        );
+    }
+}
