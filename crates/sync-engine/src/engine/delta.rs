@@ -12,10 +12,15 @@ impl SyncEngine {
         let delta_link = self.db.get_delta_link(&folder_id).await?;
         let was_full_sync = delta_link.is_none();
 
-        info!(
-            "Delta sync: calling get_delta (delta_link={})",
-            delta_link.is_some()
-        );
+        if was_full_sync {
+            info!("Delta sync: first run — fetching the full file list, this can take a while");
+        }
+        // Announce before the fetch: on a large drive the initial delta takes
+        // minutes, and the tray must not claim "up to date" meanwhile.
+        if let Err(e) = self.event_tx.send(SyncEvent::SyncStarted) {
+            warn!("Failed to send SyncStarted event: {e}");
+        }
+
         let response = self
             .graph
             .get_delta(&folder_id, delta_link.as_deref())
@@ -29,9 +34,6 @@ impl SyncEngine {
 
         let had_items = !response.items.is_empty();
         let seen_ids = if had_items {
-            if let Err(e) = self.event_tx.send(SyncEvent::SyncStarted) {
-                warn!("Failed to send SyncStarted event: {e}");
-            }
             self.handle_delta(response.items).await
         } else {
             std::collections::HashSet::new()
@@ -47,10 +49,8 @@ impl SyncEngine {
             self.reconcile_deleted_items(&seen_ids).await;
         }
 
-        if had_items {
-            if let Err(e) = self.event_tx.send(SyncEvent::SyncCompleted) {
-                warn!("Failed to send SyncCompleted event: {e}");
-            }
+        if let Err(e) = self.event_tx.send(SyncEvent::SyncCompleted) {
+            warn!("Failed to send SyncCompleted event: {e}");
         }
 
         // Periodic cleanup: remove stale cache files and tmp leftovers.

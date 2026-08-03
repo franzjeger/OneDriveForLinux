@@ -248,8 +248,10 @@ impl GraphClient {
         // Collect all pages into one response so callers get a complete batch.
         let mut all_items = Vec::new();
         let mut current_url = url;
+        let mut page = 0u32;
 
         let final_delta_link = loop {
+            page += 1;
             let resp = self
                 .request_with_retry(|| async {
                     let token = self.bearer().await?;
@@ -275,6 +277,18 @@ impl GraphClient {
             }
             let next_link = raw["@odata.nextLink"].as_str().map(String::from);
             let delta_link = raw["@odata.deltaLink"].as_str().map(String::from);
+
+            // A first full sync can run to many pages; report progress so the
+            // wait doesn't look like a hang.
+            info!(
+                "Delta page {page}: {} items so far{}",
+                all_items.len(),
+                if next_link.is_some() {
+                    ", fetching more…"
+                } else {
+                    " (last page)"
+                }
+            );
 
             if let Some(next) = next_link {
                 current_url = next;
