@@ -160,7 +160,7 @@ systemctl --user daemon-reload
 ok "Service installed"
 
 # ── Dolphin right-click menu (plain file, no compilation) ────────────────────
-cat > "$MENU_DIR/onedrive.desktop" <<'EOF'
+cat > "$MENU_DIR/onedrive.desktop" <<EOF
 [Desktop Entry]
 Type=Service
 X-KDE-ServiceTypes=KonqPopupMenu/Plugin
@@ -175,20 +175,24 @@ Icon=folder-cloud
 Name=Always keep on this device
 Name[nb]=Behold alltid på enheten
 Icon=folder-download
-Exec=odctl pin %F
+Exec=$BIN_DIR/odctl pin %F
 
 [Desktop Action OneDriveUnpin]
 Name=Free up space
 Name[nb]=Frigjør plass
 Icon=folder-cloud
-Exec=odctl unpin %F
+Exec=$BIN_DIR/odctl unpin %F
 
 [Desktop Action OneDriveSync]
 Name=Sync now
 Name[nb]=Synkroniser nå
 Icon=view-refresh
-Exec=odctl sync %f
+Exec=$BIN_DIR/odctl sync %f
 EOF
+# Plasma 5.85+ refuses to run a service menu whose .desktop file is not
+# executable, reporting "You are not authorized to execute this file" when the
+# menu entry is clicked. `cat` creates it mode 644, so set the bit explicitly.
+chmod 755 "$MENU_DIR/onedrive.desktop"
 ok "Dolphin right-click menu installed"
 
 # ── Application launcher entry ───────────────────────────────────────────────

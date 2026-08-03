@@ -280,6 +280,8 @@ crates/
 
 **"connect to daemon via D-Bus"** — the daemon must be running before using `odctl`. Start it with `systemctl --user start onedrive-linux.service`, or just open the OneDrive app from your application menu — it starts the service itself.
 
+**"You are not authorized to execute this file"** when using the OneDrive right-click menu in Dolphin — Plasma refuses to run a service menu whose `.desktop` file is not executable. Fix it with `chmod +x ~/.local/share/kio/servicemenus/onedrive.desktop`, or re-run the installer (v0.5.1 and later set the bit).
+
 **No "OneDrive" entry in the application menu** — some desktops cache the menu. Run `update-desktop-database ~/.local/share/applications` and log out and back in. Verify the entry exists at `~/.local/share/applications/onedrive-linux.desktop`.
 
 **Rate limiting** — the Graph API enforces per-user rate limits. The client respects `Retry-After` headers automatically.
