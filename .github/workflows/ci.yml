@@ -49,22 +49,24 @@ jobs:
   overlay-plugin:
     name: Dolphin overlay plugin
     runs-on: ubuntu-latest
+    # Ubuntu 24.04 has no KF6 development packages, so the plugin is built in
+    # an Arch container instead — which also matches the distribution people
+    # actually run Plasma 6 on.
+    container: archlinux:latest
     steps:
-      - uses: actions/checkout@v7
-
-      # The plugin is C++ against KDE Frameworks 6 and is built by
-      # install.sh --with-dolphin-overlay, so nothing else in CI touches it.
-      # Without this job a configure or compile error only surfaces on a user's
-      # machine, which is exactly how it happened: kcoreaddons_add_plugin()
-      # aborted on an unset CMAKE_LIBRARY_OUTPUT_DIRECTORY and took four rounds
-      # of back-and-forth to find.
+      # Before checkout: actions/checkout needs git present in the container.
       - name: Install KDE Frameworks 6 build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake extra-cmake-modules \
-            qt6-base-dev libkf6kio-dev libkf6coreaddons-dev
+          pacman -Syu --noconfirm --needed \
+            base-devel cmake extra-cmake-modules kio qt6-base git
 
+      - uses: actions/checkout@v7
+
+      # The plugin is C++ against KDE Frameworks 6 and is built only by
+      # install.sh --with-dolphin-overlay, so nothing else in CI touches it.
+      # Without this job a configure or compile error surfaces first on a
+      # user's machine — which is how kcoreaddons_add_plugin() aborting on an
+      # unset CMAKE_LIBRARY_OUTPUT_DIRECTORY took four rounds to find.
       - name: Configure
         run: cmake -S extensions/dolphin -B build-overlay -DCMAKE_BUILD_TYPE=Release
 
