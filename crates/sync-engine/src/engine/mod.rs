@@ -342,6 +342,29 @@ impl SyncEngine {
         }
     }
 
+    /// Files changed in both places, for a review UI.
+    pub async fn conflicts(&self, limit: usize) -> Vec<(PathBuf, String)> {
+        self.db
+            .conflicted_items(limit)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| {
+                // The copy of the user's version kept when the upload was
+                // refused, so the UI can name it rather than leave them
+                // hunting for it.
+                let kept = self
+                    .cache_dir
+                    .as_ref()
+                    .map(|dir| dir.join(format!("conflict-{}", item.id)))
+                    .filter(|p| p.exists())
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                (item.local_path, kept)
+            })
+            .collect()
+    }
+
     /// Top-level folder names, for a selection UI.
     pub async fn top_level_folders(&self) -> Vec<String> {
         self.db

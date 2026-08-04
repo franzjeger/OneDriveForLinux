@@ -35,6 +35,12 @@ pub enum GraphError {
     #[error("Delta token expired — a full resync is required")]
     ResyncRequired,
 
+    /// The item changed on OneDrive since the version we based our edit on
+    /// (HTTP 412). Overwriting anyway would destroy whoever else's change that
+    /// was, so the caller has to reconcile rather than retry.
+    #[error("The file changed on OneDrive since it was last synced")]
+    Conflict,
+
     #[error("Rate limited, retry after {retry_after_secs}s")]
     RateLimited { retry_after_secs: u64 },
 }

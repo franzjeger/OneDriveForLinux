@@ -544,6 +544,59 @@ Sync resumes automatically.",
 
             ui.separator();
 
+            // ── Conflicts ─────────────────────────────────────────────
+            // Shown above recent activity because it is the one thing here
+            // that needs a decision from the user rather than just informing
+            // them. Both versions exist on disk; nothing is lost either way.
+            if !s.conflicts.is_empty() {
+                ui.label(
+                    RichText::new("CHANGED IN BOTH PLACES")
+                        .size(10.5)
+                        .color(BAD)
+                        .strong(),
+                );
+                ui.label(
+                    RichText::new(
+                        "These were edited here and on OneDrive. Your version was kept \
+                         alongside the one from OneDrive — open them and keep whichever \
+                         you want.",
+                    )
+                    .color(MUTED)
+                    .size(11.0),
+                );
+                for (path, kept) in s.conflicts.clone().iter().take(5) {
+                    let name = std::path::Path::new(path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.clone());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&name).strong().size(12.5).color(BAD));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Show").clicked() {
+                                // Select the file in the file manager rather
+                                // than opening it — the point is to compare.
+                                let target = std::path::Path::new(path)
+                                    .parent()
+                                    .map(|p| p.to_path_buf())
+                                    .unwrap_or_default();
+                                let _ = std::process::Command::new("xdg-open").arg(target).spawn();
+                            }
+                            if !kept.is_empty() && ui.small_button("Your copy").clicked() {
+                                let _ = std::process::Command::new("xdg-open").arg(kept).spawn();
+                            }
+                        });
+                    });
+                }
+                if s.conflicts.len() > 5 {
+                    ui.label(
+                        RichText::new(format!("… and {} more", s.conflicts.len() - 5))
+                            .color(MUTED)
+                            .size(11.0),
+                    );
+                }
+                ui.separator();
+            }
+
             // ── Recent activity ───────────────────────────────────────
             ui.label(
                 RichText::new("RECENT ACTIVITY")

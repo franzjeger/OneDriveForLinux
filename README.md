@@ -9,7 +9,7 @@ A native OneDrive client for Linux featuring:
 - **System tray** integration (KDE/GNOME via StatusNotifier/AppIndicator)
 - **OAuth2 device code flow** — no client secret required
 - **Full Microsoft Graph API** sync with delta polling
-- **Conflict resolution** — local conflicts are renamed with timestamps
+- **Conflicts keep both versions** — uploads carry an `If-Match` precondition, so a file changed in both places is never silently overwritten; your copy is preserved and both are listed in the app
 - **Pin / unpin** — keep chosen files or folders always on device, or free space back to cloud-only
 - **Download integrity** — every download is verified against the server's QuickXorHash
 - **Dolphin overlay icons** — sync-state emblems on file icons in KDE's file manager, so you can see at a glance what is on disk and what is still in the cloud. Opt in with `--with-dolphin-overlay` (see `extensions/dolphin/README.md`)

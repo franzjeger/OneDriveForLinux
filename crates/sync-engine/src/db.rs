@@ -379,6 +379,27 @@ impl Database {
         .await
     }
 
+    /// Items currently in conflict, newest first, capped for display.
+    pub async fn conflicted_items(&self, limit: usize) -> Result<Vec<DbItem>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, local_path, name, parent_id, etag, ctag, size,
+                        modified_at, created_at, sha1_hash, quick_xor_hash,
+                        is_folder, is_placeholder, sync_state, pinned
+                 FROM items WHERE sync_state = 'conflict'
+                 ORDER BY modified_at DESC
+                 LIMIT ?1",
+            )?;
+            let mut rows = stmt.query(params![limit as i64])?;
+            let mut items = Vec::new();
+            while let Some(row) = rows.next()? {
+                items.push(row_to_item(row)?);
+            }
+            Ok(items)
+        })
+        .await
+    }
+
     /// The few items a user would want named: in flight, failed, or conflicted.
     /// Capped, because this exists to be displayed, not enumerated.
     pub async fn items_needing_attention(&self, limit: usize) -> Result<Vec<(PathBuf, SyncState)>> {
@@ -1164,6 +1185,35 @@ mod tests {
             plan.contains("COVERING INDEX"),
             "folder-state probe is not index-only; plan was: {plan}"
         );
+    }
+
+    #[tokio::test]
+    async fn conflicted_items_returns_only_conflicts() {
+        let (_dir, db) = open_temp_db();
+        for (id, path, state) in [
+            ("ok", "/sync/a", SyncState::Synced),
+            ("clash", "/sync/b", SyncState::Conflict),
+            ("bad", "/sync/c", SyncState::Error("boom".into())),
+        ] {
+            let mut item = test_item(id, path);
+            item.sync_state = state;
+            db.upsert_item(&item).await.unwrap();
+        }
+
+        let conflicts = db.conflicted_items(10).await.unwrap();
+        assert_eq!(conflicts.len(), 1, "an error is not a conflict");
+        assert_eq!(conflicts[0].id, "clash");
+    }
+
+    #[tokio::test]
+    async fn conflicted_items_respects_its_limit() {
+        let (_dir, db) = open_temp_db();
+        for n in 0..8 {
+            let mut item = test_item(&format!("c{n}"), &format!("/sync/f{n}"));
+            item.sync_state = SyncState::Conflict;
+            db.upsert_item(&item).await.unwrap();
+        }
+        assert_eq!(db.conflicted_items(3).await.unwrap().len(), 3);
     }
 
     #[tokio::test]
