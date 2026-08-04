@@ -12,7 +12,7 @@ use fuse3::{
 use futures::stream;
 use graph_client::GraphClient;
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     ffi::OsStr,
     os::unix::fs::FileExt,
     sync::{
@@ -22,6 +22,15 @@ use std::{
     time::SystemTime,
 };
 use sync_engine::{Database, DbItem, SyncState};
+
+/// How long a folder's aggregate sync state is reused before recomputing.
+/// Slightly longer than the Dolphin plugin's own 5s cache, so a screenful of
+/// folders refreshing together costs one query each rather than one per poll.
+const FOLDER_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Cap on cached folder states, so browsing a large drive cannot grow it
+/// without bound.
+const MAX_FOLDER_STATE_CACHE: usize = 2048;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -71,6 +80,14 @@ pub struct OneDriveFS {
     open_files: RwLock<BTreeMap<u64, std::fs::File>>,
     /// file handles that have had write() called — uploaded on release()
     dirty_fhs: RwLock<HashSet<u64>>,
+    /// Short-lived cache of folder aggregate states, keyed by item ID.
+    ///
+    /// A file manager showing sync-state emblems asks for this attribute on
+    /// every visible folder, every few seconds. Answering it means probing the
+    /// whole subtree, and a folder whose descendants are all cloud-only has to
+    /// walk all of them before it can say so. Caching briefly turns a screenful
+    /// of folders re-asking into one query each.
+    folder_state_cache: RwLock<HashMap<String, (SyncState, std::time::Instant)>>,
     fh_counter: AtomicU64,
     sync_dir: std::path::PathBuf,
     /// Local directory for caching downloaded on-demand files.
@@ -107,6 +124,7 @@ impl OneDriveFS {
             id_to_inode: RwLock::new(BTreeMap::new()),
             open_files: RwLock::new(BTreeMap::new()),
             dirty_fhs: RwLock::new(HashSet::new()),
+            folder_state_cache: RwLock::new(HashMap::new()),
             fh_counter: AtomicU64::new(1),
             sync_dir,
             cache_dir,
@@ -169,6 +187,36 @@ impl OneDriveFS {
             .await
             .insert(item_id.to_string(), ino);
         ino
+    }
+
+    /// A folder's aggregate sync state, cached briefly.
+    ///
+    /// The value is derived from the whole subtree, so it is expensive to
+    /// compute and cheap to be slightly stale — a folder does not change from
+    /// "all in the cloud" to "partly downloaded" without the user doing
+    /// something, and the emblem catching up a few seconds later is invisible.
+    async fn folder_aggregate_state(&self, item: &DbItem) -> SyncState {
+        if let Some((state, at)) = self.folder_state_cache.read().await.get(&item.id) {
+            if at.elapsed() < FOLDER_STATE_TTL {
+                return state.clone();
+            }
+        }
+
+        let state = self
+            .db
+            .get_folder_aggregate_state(&item.local_path)
+            .await
+            .unwrap_or(SyncState::CloudOnly);
+
+        let mut cache = self.folder_state_cache.write().await;
+        // Bounded: a long browsing session should not accumulate an entry per
+        // folder ever visited. Everything in here is recomputable, so dropping
+        // the lot is always safe.
+        if cache.len() >= MAX_FOLDER_STATE_CACHE {
+            cache.clear();
+        }
+        cache.insert(item.id.clone(), (state.clone(), std::time::Instant::now()));
+        state
     }
 
     fn db_item_to_attr(&self, item: &DbItem, ino: u64) -> FileAttr {
@@ -1190,11 +1238,7 @@ impl Filesystem for OneDriveFS {
             "pinned"
         } else if item.is_folder {
             // Aggregate state: reflect whether descendants are in cloud or local.
-            let agg = self
-                .db
-                .get_folder_aggregate_state(&item.local_path)
-                .await
-                .unwrap_or(SyncState::CloudOnly);
+            let agg = self.folder_aggregate_state(&item).await;
             match agg {
                 SyncState::Pinned => "pinned",
                 SyncState::Synced => "synced",
