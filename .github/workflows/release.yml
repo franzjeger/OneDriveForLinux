@@ -33,9 +33,24 @@ jobs:
       - name: Build
         run: cargo build --release --workspace
 
-      - name: Package
+      # A dispatch input is free text and the tag is used verbatim, so a
+      # version typed without the leading "v" produces a tag the push trigger
+      # ("v*") would never match and install.sh does not recognise. Normalise
+      # once, here, rather than relying on whoever types it.
+      - name: Resolve the version
+        id: version
         run: |
           VERSION="${{ github.event.inputs.version || github.ref_name }}"
+          case "$VERSION" in
+            v*) ;;
+            *) VERSION="v$VERSION" ;;
+          esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing $VERSION"
+
+      - name: Package
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
           DIST="onedrive-linux-${VERSION}-x86_64"
           mkdir -p "$DIST"
           cp target/release/onedrive-daemon target/release/odctl target/release/onedrive-flyout "$DIST/"
@@ -52,7 +67,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.version || github.ref_name }}
+          tag_name: ${{ steps.version.outputs.version }}
           files: |
             onedrive-linux-*.tar.gz
             onedrive-linux-*.tar.gz.sha256
