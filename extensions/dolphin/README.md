@@ -28,6 +28,14 @@ sudo cmake --install build
 kquitapp6 dolphin   # restart Dolphin to load the plugin
 ```
 
+### If configure fails on CMAKE_LIBRARY_OUTPUT_DIRECTORY
+
+`kcoreaddons_add_plugin()` refuses to run when `CMAKE_LIBRARY_OUTPUT_DIRECTORY`
+is unset, and reports "set it explicitly or include KDECMakeSettings" even
+though `KDECMakeSettings` *is* included — ECM 6.28 with CMake 4 does not always
+set it. The CMakeLists sets the output directories itself for that reason; if
+you see this error, you are building an older copy of the sources.
+
 ### Why it installs system-wide
 
 Qt only scans the plugin directories in `QCoreApplication::libraryPaths()` —

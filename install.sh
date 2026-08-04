@@ -334,20 +334,31 @@ if [ "$OVERLAY" = 1 ]; then
 fi
 
 if [ "$OVERLAY" = 1 ]; then
-    if ! command -v cmake >/dev/null 2>&1 || ! command -v g++ >/dev/null 2>&1; then
-        say "Installing build dependencies…"
-        if command -v pacman >/dev/null 2>&1; then
-            sudo pacman -S --needed --noconfirm base-devel cmake extra-cmake-modules kio qt6-base \
-                || warn "Dependency install failed — continuing anyway."
-        elif command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get install -y build-essential cmake extra-cmake-modules \
-                libkf6kio-dev qt6-base-dev || warn "Dependency install failed — continuing anyway."
-        elif command -v dnf >/dev/null 2>&1; then
-            sudo dnf install -y gcc-c++ cmake extra-cmake-modules kf6-kio-devel qt6-qtbase-devel \
-                || warn "Dependency install failed — continuing anyway."
-        else
-            overlay_give_up "unknown distribution; install cmake, extra-cmake-modules and the KF6 KIO development package yourself"
-        fi
+    # Always ensure the KDE/Qt development packages, not only when the compiler
+    # happens to be missing: a machine with a toolchain but no KF6 headers is
+    # the common case, and it fails at find_package() with a message most people
+    # would not connect to a missing package. The package managers all no-op
+    # when everything is already present.
+    say "Installing build dependencies…"
+    if command -v pacman >/dev/null 2>&1; then
+        sudo pacman -S --needed --noconfirm \
+            base-devel cmake extra-cmake-modules kio qt6-base \
+            || warn "Dependency install failed — trying to build anyway."
+    elif command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get install -y \
+            build-essential cmake extra-cmake-modules libkf6kio-dev qt6-base-dev \
+            || warn "Dependency install failed — trying to build anyway."
+    elif command -v dnf >/dev/null 2>&1; then
+        sudo dnf install -y \
+            gcc-c++ cmake extra-cmake-modules kf6-kio-devel qt6-qtbase-devel \
+            || warn "Dependency install failed — trying to build anyway."
+    elif command -v zypper >/dev/null 2>&1; then
+        sudo zypper install -y \
+            gcc-c++ cmake extra-cmake-modules kio-devel qt6-base-devel \
+            || warn "Dependency install failed — trying to build anyway."
+    else
+        warn "Unknown distribution — install cmake, extra-cmake-modules and the"
+        echo "     KF6 KIO development package yourself if the build below fails."
     fi
 fi
 
@@ -366,24 +377,37 @@ if [ "$OVERLAY" = 1 ]; then
 fi
 
 if [ "$OVERLAY" = 1 ]; then
-    OVERLAY_BUILD=$(mktemp -d)
-    if cmake -S "$OVERLAY_SRC" -B "$OVERLAY_BUILD" \
+    # Keep the sources and the build outside the download temp dir, which is
+    # removed when the script exits: a failure the user cannot reproduce or
+    # read the error from is barely better than no message at all.
+    OVERLAY_WORK="${XDG_CACHE_HOME:-$HOME/.cache}/onedrive-linux/overlay-build"
+    OVERLAY_LOG="$OVERLAY_WORK/build.log"
+    rm -rf "$OVERLAY_WORK"
+    mkdir -p "$OVERLAY_WORK"
+    cp -r "$OVERLAY_SRC" "$OVERLAY_WORK/src"
+
+    if cmake -S "$OVERLAY_WORK/src" -B "$OVERLAY_WORK/build" \
              -DCMAKE_BUILD_TYPE=Release \
-             -DKDE_INSTALL_PLUGINDIR="$QT_PLUGIN_DIR" >/dev/null 2>&1 \
-       && cmake --build "$OVERLAY_BUILD" -j"$(nproc)" >/dev/null 2>&1; then
-        if sudo cmake --install "$OVERLAY_BUILD" >/dev/null 2>&1; then
+             -DKDE_INSTALL_PLUGINDIR="$QT_PLUGIN_DIR" >"$OVERLAY_LOG" 2>&1 \
+       && cmake --build "$OVERLAY_WORK/build" -j"$(nproc)" >>"$OVERLAY_LOG" 2>&1; then
+        if sudo cmake --install "$OVERLAY_WORK/build" >>"$OVERLAY_LOG" 2>&1; then
             ok "Dolphin overlay plugin installed to $QT_PLUGIN_DIR/kf6/overlayicon"
             echo "     Restart Dolphin to see sync-state emblems: kquitapp6 dolphin"
         else
-            overlay_give_up "could not install to $QT_PLUGIN_DIR (needs sudo)"
+            warn "Built the overlay plugin but could not install it to $QT_PLUGIN_DIR."
+            echo "     Last lines of $OVERLAY_LOG:"
+            tail -n 15 "$OVERLAY_LOG" | sed 's/^/       /'
         fi
     else
-        warn "The overlay plugin failed to build. Re-run these to see why:"
-        echo "     cmake -S $OVERLAY_SRC -B /tmp/od-overlay -DKDE_INSTALL_PLUGINDIR=$QT_PLUGIN_DIR"
-        echo "     cmake --build /tmp/od-overlay"
-        echo "     Everything else is installed and working."
+        warn "The overlay plugin failed to build. Everything else is installed and working."
+        echo
+        echo "     Last 25 lines of $OVERLAY_LOG:"
+        tail -n 25 "$OVERLAY_LOG" | sed 's/^/       /'
+        echo
+        echo "     The sources are kept at $OVERLAY_WORK/src, so you can retry with:"
+        echo "       cmake -S $OVERLAY_WORK/src -B $OVERLAY_WORK/build -DKDE_INSTALL_PLUGINDIR=$QT_PLUGIN_DIR"
+        echo "       cmake --build $OVERLAY_WORK/build"
     fi
-    rm -rf "$OVERLAY_BUILD"
 fi
 
 # ── Config ───────────────────────────────────────────────────────────────────
