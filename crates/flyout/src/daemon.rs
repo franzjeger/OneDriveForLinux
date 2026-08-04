@@ -10,7 +10,7 @@ use zbus::proxy;
     default_path = "/com/onedrive/linux1"
 )]
 pub trait OneDriveControl {
-    fn get_status(&self) -> zbus::Result<Vec<(String, String)>>;
+    fn get_state_counts(&self) -> zbus::Result<Vec<(String, u32)>>;
     fn is_paused(&self) -> zbus::Result<bool>;
     fn get_quota(&self) -> zbus::Result<(u64, u64)>;
     fn get_recent(&self) -> zbus::Result<Vec<(String, String, i64)>>;
@@ -82,7 +82,9 @@ impl DaemonClient {
         let Some(proxy) = &self.proxy else {
             return Snapshot::default();
         };
-        let Ok(items) = proxy.get_status() else {
+        // Counts, not the item table: this runs every couple of seconds, and a
+        // large drive has hundreds of thousands of items.
+        let Ok(counts) = proxy.get_state_counts() else {
             return Snapshot::default();
         };
 
@@ -92,14 +94,16 @@ impl DaemonClient {
             needs_auth: proxy.needs_auth().unwrap_or(false),
             progress: proxy.get_progress().unwrap_or_default(),
             pending_uploads: proxy.pending_uploads().unwrap_or(0),
-            total_items: items.len(),
             ..Default::default()
         };
-        for (_, state) in &items {
+        for (state, count) in &counts {
+            let count = *count as usize;
+            snap.total_items += count;
+            // Keyed on the stored state name, which is stable, rather than on
+            // the human-readable text, which is not.
             match state.as_str() {
-                "Syncing" => snap.syncing += 1,
-                s if s.starts_with("Error") => snap.errors += 1,
-                "Conflict" => snap.errors += 1,
+                "syncing" => snap.syncing += count,
+                "error" | "conflict" => snap.errors += count,
                 _ => {}
             }
         }

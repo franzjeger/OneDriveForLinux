@@ -346,6 +346,50 @@ impl Database {
         .await
     }
 
+    /// How many items are in each sync state.
+    ///
+    /// Counting in SQL rather than loading every row: a large drive has
+    /// hundreds of thousands of items, and callers that only want totals
+    /// should not pay for materialising all of them.
+    pub async fn state_counts(&self) -> Result<Vec<(String, u64)>> {
+        self.with_conn(move |conn| {
+            let mut stmt =
+                conn.prepare("SELECT sync_state, COUNT(*) FROM items GROUP BY sync_state")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(rows)
+        })
+        .await
+    }
+
+    /// The few items a user would want named: in flight, failed, or conflicted.
+    /// Capped, because this exists to be displayed, not enumerated.
+    pub async fn items_needing_attention(&self, limit: usize) -> Result<Vec<(PathBuf, SyncState)>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT local_path, sync_state FROM items
+                 WHERE sync_state IN ('syncing', 'error', 'conflict')
+                 ORDER BY sync_state
+                 LIMIT ?1",
+            )?;
+            let rows = stmt
+                .query_map(params![limit as i64], |row| {
+                    Ok((
+                        PathBuf::from(row.get::<_, String>(0)?),
+                        SyncState::from_db_str(&row.get::<_, String>(1)?),
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(rows)
+        })
+        .await
+    }
+
     pub async fn all_items(&self) -> Result<Vec<DbItem>> {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
@@ -975,6 +1019,71 @@ mod tests {
             .unwrap();
         db.dequeue_upload("d").await.unwrap();
         assert_eq!(db.pending_upload_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn state_counts_group_without_loading_rows() {
+        let (_dir, db) = open_temp_db();
+        for (id, path, state) in [
+            ("a", "/sync/a", SyncState::Synced),
+            ("b", "/sync/b", SyncState::Synced),
+            ("c", "/sync/c", SyncState::CloudOnly),
+            ("d", "/sync/d", SyncState::Error("boom".into())),
+        ] {
+            let mut item = test_item(id, path);
+            item.sync_state = state;
+            db.upsert_item(&item).await.unwrap();
+        }
+
+        let counts = db.state_counts().await.unwrap();
+        let get = |name: &str| {
+            counts
+                .iter()
+                .find(|(s, _)| s == name)
+                .map(|(_, n)| *n)
+                .unwrap_or(0)
+        };
+        assert_eq!(get("synced"), 2);
+        assert_eq!(get("cloud_only"), 1);
+        assert_eq!(get("error"), 1);
+        // The totals must add up to every row, or a status display silently
+        // under-reports how much is tracked.
+        assert_eq!(counts.iter().map(|(_, n)| n).sum::<u64>(), 4);
+    }
+
+    #[tokio::test]
+    async fn attention_list_is_only_the_states_worth_naming() {
+        let (_dir, db) = open_temp_db();
+        for (id, path, state) in [
+            ("quiet", "/sync/quiet", SyncState::Synced),
+            ("cloudy", "/sync/cloudy", SyncState::CloudOnly),
+            ("busy", "/sync/busy", SyncState::Syncing),
+            ("broken", "/sync/broken", SyncState::Error("boom".into())),
+            ("clash", "/sync/clash", SyncState::Conflict),
+        ] {
+            let mut item = test_item(id, path);
+            item.sync_state = state;
+            db.upsert_item(&item).await.unwrap();
+        }
+
+        let attention = db.items_needing_attention(10).await.unwrap();
+        let names: std::collections::HashSet<_> = attention
+            .iter()
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names.len(), 3, "got {names:?}");
+        assert!(names.contains("busy") && names.contains("broken") && names.contains("clash"));
+    }
+
+    #[tokio::test]
+    async fn attention_list_respects_its_limit() {
+        let (_dir, db) = open_temp_db();
+        for n in 0..10 {
+            let mut item = test_item(&format!("id{n}"), &format!("/sync/f{n}"));
+            item.sync_state = SyncState::Syncing;
+            db.upsert_item(&item).await.unwrap();
+        }
+        assert_eq!(db.items_needing_attention(3).await.unwrap().len(), 3);
     }
 
     #[tokio::test]

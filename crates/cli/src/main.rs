@@ -14,6 +14,8 @@ trait OneDriveControl {
     async fn pause(&self) -> zbus::Result<()>;
     async fn resume(&self) -> zbus::Result<()>;
     async fn get_status(&self) -> zbus::Result<Vec<(String, String)>>;
+    async fn get_state_counts(&self) -> zbus::Result<Vec<(String, u32)>>;
+    async fn get_attention_items(&self, limit: u32) -> zbus::Result<Vec<(String, String)>>;
     async fn force_sync(&self, path: String) -> zbus::Result<()>;
     async fn is_paused(&self) -> zbus::Result<bool>;
     async fn pin_item(&self, path: String) -> zbus::Result<()>;
@@ -166,16 +168,19 @@ async fn cmd_status(all: bool) -> Result<()> {
         .context("connect to D-Bus session bus")?;
     let proxy = make_proxy(&conn).await?;
 
-    let items = proxy.get_status().await.context("get_status D-Bus call")?;
     let paused = proxy.is_paused().await.unwrap_or(false);
     let style = Style::detect();
 
-    if items.is_empty() {
-        println!("No items tracked yet.");
-        return Ok(());
-    }
-
+    // --all is the only mode that genuinely needs every row. The summary asks
+    // the daemon to count in SQL instead: on a large drive the full table is
+    // hundreds of thousands of entries, and shipping it over the bus to derive
+    // six numbers is pure waste.
     if all {
+        let items = proxy.get_status().await.context("get_status D-Bus call")?;
+        if items.is_empty() {
+            println!("No items tracked yet.");
+            return Ok(());
+        }
         if paused {
             println!("{}", style.warn("[PAUSED]"));
         }
@@ -187,31 +192,49 @@ async fn cmd_status(all: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Summary first: the answer before the list.
-    let mut synced = 0u32;
-    let mut syncing: Vec<&str> = Vec::new();
-    let mut cloud = 0u32;
-    let mut pinned = 0u32;
-    let mut local = 0u32;
-    let mut errors: Vec<(&str, &str)> = Vec::new();
-    for (path, state) in &items {
-        match state.as_str() {
-            "Synced" | "Partially synced" => synced += 1,
-            "Syncing" => syncing.push(path),
-            "Cloud only" => cloud += 1,
-            "Pinned" => pinned += 1,
-            "Local only" => local += 1,
-            s if s.starts_with("Error") => errors.push((path, state)),
-            "Conflict" => errors.push((path, state)),
-            _ => {}
-        }
+    let counts = proxy
+        .get_state_counts()
+        .await
+        .context("get_state_counts D-Bus call")?;
+    let total: u32 = counts.iter().map(|(_, n)| n).sum();
+    if total == 0 {
+        println!("No items tracked yet.");
+        return Ok(());
     }
+    let count_of = |name: &str| -> u32 {
+        counts
+            .iter()
+            .find(|(state, _)| state == name)
+            .map(|(_, n)| *n)
+            .unwrap_or(0)
+    };
+    // Names are the stored state strings, which are stable, unlike the
+    // human-readable text they are rendered as.
+    let synced = count_of("synced") + count_of("partial");
+    let cloud = count_of("cloud_only");
+    let pinned = count_of("pinned");
+    let local = count_of("local_only");
+    let syncing_count = count_of("syncing");
+    let error_count = count_of("error") + count_of("conflict");
+
+    // Only the handful actually shown are fetched.
+    let attention = proxy.get_attention_items(10).await.unwrap_or_default();
+    let syncing: Vec<&str> = attention
+        .iter()
+        .filter(|(_, state)| state == "Syncing")
+        .map(|(path, _)| path.as_str())
+        .collect();
+    let errors: Vec<(&str, &str)> = attention
+        .iter()
+        .filter(|(_, state)| state != "Syncing")
+        .map(|(path, state)| (path.as_str(), state.as_str()))
+        .collect();
 
     let headline = if paused {
         style.warn("⏸ paused")
-    } else if !errors.is_empty() {
+    } else if error_count > 0 {
         style.bad("● needs attention")
-    } else if !syncing.is_empty() {
+    } else if syncing_count > 0 {
         style.accent("↻ syncing")
     } else {
         style.good("● up to date")
@@ -220,7 +243,7 @@ async fn cmd_status(all: bool) -> Result<()> {
         "{}  {} {}",
         style.bold("OneDrive"),
         headline,
-        style.dim(&format!("· {} items tracked", items.len()))
+        style.dim(&format!("· {total} items tracked"))
     );
     println!();
     println!(
@@ -228,11 +251,11 @@ async fn cmd_status(all: bool) -> Result<()> {
         style.good(&format!("✓ {synced} synced")),
         style.warn(&format!("● {pinned} pinned")),
         style.dim(&format!("○ {cloud} cloud-only")),
-        style.accent(&format!("↻ {} syncing", syncing.len())),
-        if errors.is_empty() {
+        style.accent(&format!("↻ {syncing_count} syncing")),
+        if error_count == 0 {
             style.dim("✗ 0 errors")
         } else {
-            style.bad(&format!("✗ {} errors", errors.len()))
+            style.bad(&format!("✗ {error_count} errors"))
         },
     );
     if local > 0 {
@@ -244,10 +267,13 @@ async fn cmd_status(all: bool) -> Result<()> {
         for path in syncing.iter().take(5) {
             println!("  {} {path}", style.accent("↻"));
         }
-        if syncing.len() > 5 {
+        if syncing_count as usize > syncing.len().min(5) {
             println!(
                 "  {}",
-                style.dim(&format!("… and {} more", syncing.len() - 5))
+                style.dim(&format!(
+                    "… and {} more",
+                    syncing_count as usize - syncing.len().min(5)
+                ))
             );
         }
     }
