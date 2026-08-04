@@ -106,11 +106,7 @@ impl SyncEngine {
             }
 
             let _guard = self.item_lock(&entry.item_id).lock_owned().await;
-            match self
-                .graph
-                .upload_file(&entry.parent_id, &entry.name, &entry.source_path)
-                .await
-            {
+            match self.upload_resumable(&entry).await {
                 Ok(updated) => {
                     if let Err(e) = self.db.dequeue_upload(&entry.item_id).await {
                         warn!("Upload of {} succeeded but dequeue failed: {e}", entry.name);
@@ -126,6 +122,7 @@ impl SyncEngine {
                             entry.name
                         );
                         let _ = self.db.dequeue_upload(&entry.item_id).await;
+                        let _ = self.db.clear_upload_session(&entry.item_id).await;
                         let _ = self
                             .db
                             .set_sync_state(&entry.item_id, &SyncState::Error(e.to_string()))
@@ -148,6 +145,75 @@ impl SyncEngine {
                 }
             }
         }
+    }
+
+    /// Upload a queued entry, continuing a previous attempt where possible.
+    ///
+    /// Large files go through a Graph upload session. Without remembering the
+    /// session, a transfer interrupted at 90% starts again from zero on the
+    /// next attempt — and with backoff up to eight attempts, a big file on a
+    /// poor connection can resend itself many times over and still fail.
+    async fn upload_resumable(&self, entry: &PendingUpload) -> Result<DriveItem, GraphError> {
+        let size = std::fs::metadata(&entry.source_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        if size <= GraphClient::large_file_threshold() {
+            return self
+                .graph
+                .upload_file(&entry.parent_id, &entry.name, &entry.source_path)
+                .await;
+        }
+
+        // Continue the stored session if Graph still has it.
+        if let Ok(Some(url)) = self.db.get_upload_session(&entry.item_id).await {
+            if let Some(offset) = self.graph.upload_session_offset(&url).await {
+                let session = graph_client::UploadSession {
+                    upload_url: url,
+                    expiration_date_time: None,
+                    next_expected_ranges: None,
+                };
+                info!(
+                    "Resuming upload of {} from byte {offset} of {size}",
+                    entry.name
+                );
+                let result = self
+                    .graph
+                    .upload_via_session_from(&session, &entry.source_path, size, offset)
+                    .await;
+                if result.is_ok() {
+                    let _ = self.db.clear_upload_session(&entry.item_id).await;
+                }
+                return result;
+            }
+            // Gone or expired — fall through and start a fresh one.
+            let _ = self.db.clear_upload_session(&entry.item_id).await;
+        }
+
+        let session = self
+            .graph
+            .get_upload_session(&entry.parent_id, &entry.name, size)
+            .await?;
+        // Stored before the first byte goes out, so an interruption at any
+        // point still leaves something to resume from.
+        if let Err(e) = self
+            .db
+            .save_upload_session(&entry.item_id, &session.upload_url)
+            .await
+        {
+            warn!(
+                "Could not remember the upload session for {}: {e}",
+                entry.name
+            );
+        }
+        let result = self
+            .graph
+            .upload_via_session_from(&session, &entry.source_path, size, 0)
+            .await;
+        if result.is_ok() {
+            let _ = self.db.clear_upload_session(&entry.item_id).await;
+        }
+        result
     }
 
     /// Record a successful upload against the item's current database row.

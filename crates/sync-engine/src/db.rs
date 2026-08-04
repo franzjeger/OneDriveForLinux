@@ -121,6 +121,15 @@ impl Database {
              CREATE INDEX IF NOT EXISTS idx_upload_queue_next
                  ON upload_queue(next_attempt);
 
+             -- Resumable upload sessions for large files. Kept out of
+             -- upload_queue because a session outlives any one attempt and is
+             -- what makes a retry continue rather than start over.
+             CREATE TABLE IF NOT EXISTS upload_sessions (
+                 item_id     TEXT PRIMARY KEY,
+                 upload_url  TEXT NOT NULL,
+                 created_at  TEXT NOT NULL
+             );
+
              CREATE TABLE IF NOT EXISTS local_symlinks (
                  parent_path TEXT NOT NULL,
                  name        TEXT NOT NULL,
@@ -375,6 +384,61 @@ impl Database {
                 .filter_map(|r| r.ok())
                 .collect();
             Ok(rows)
+        })
+        .await
+    }
+
+    /// Remember a resumable upload session so a later attempt can continue it.
+    pub async fn save_upload_session(&self, item_id: &str, upload_url: &str) -> Result<()> {
+        let (item_id, upload_url) = (item_id.to_string(), upload_url.to_string());
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO upload_sessions (item_id, upload_url, created_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(item_id) DO UPDATE SET
+                     upload_url = excluded.upload_url,
+                     created_at = excluded.created_at",
+                params![item_id, upload_url, Utc::now().to_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// A stored session, if it is recent enough to still be worth trying.
+    /// Graph keeps sessions for hours; anything older is assumed gone.
+    pub async fn get_upload_session(&self, item_id: &str) -> Result<Option<String>> {
+        let item_id = item_id.to_string();
+        let cutoff = Utc::now() - chrono::Duration::hours(12);
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT upload_url, created_at FROM upload_sessions WHERE item_id = ?1",
+            )?;
+            let mut rows = stmt.query(params![item_id])?;
+            if let Some(row) = rows.next()? {
+                let url: String = row.get(0)?;
+                let created: String = row.get(1)?;
+                let fresh = created
+                    .parse::<DateTime<Utc>>()
+                    .map(|t| t > cutoff)
+                    .unwrap_or(false);
+                if fresh {
+                    return Ok(Some(url));
+                }
+            }
+            Ok(None)
+        })
+        .await
+    }
+
+    pub async fn clear_upload_session(&self, item_id: &str) -> Result<()> {
+        let item_id = item_id.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "DELETE FROM upload_sessions WHERE item_id = ?1",
+                params![item_id],
+            )?;
+            Ok(())
         })
         .await
     }
@@ -1206,6 +1270,39 @@ mod tests {
             plan.contains("COVERING INDEX"),
             "folder-state probe is not index-only; plan was: {plan}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_upload_session_round_trips() {
+        let (_dir, db) = open_temp_db();
+        db.save_upload_session("item1", "https://example/session/1")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_upload_session("item1").await.unwrap().as_deref(),
+            Some("https://example/session/1")
+        );
+        db.clear_upload_session("item1").await.unwrap();
+        assert!(db.get_upload_session("item1").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_stale_session_is_not_offered() {
+        let (_dir, db) = open_temp_db();
+        // Written directly with an old timestamp: resuming against a session
+        // Graph has long since dropped would just waste a round trip.
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO upload_sessions (item_id, upload_url, created_at)
+                 VALUES ('old', 'https://example/s', ?1)",
+                params![(Utc::now() - chrono::Duration::days(2)).to_rfc3339()],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert!(db.get_upload_session("old").await.unwrap().is_none());
     }
 
     #[tokio::test]
