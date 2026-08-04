@@ -151,6 +151,14 @@ impl SyncEngine {
                 continue;
             }
 
+            // Exclusions apply to what comes down as well as what goes up.
+            // Without this, patterns like "*.tmp" and ".~lock.*" filter the
+            // upload direction only, and every editor artefact anyone else's
+            // machine has ever synced still shows up in the mount.
+            if crate::filters::is_excluded_name(&item.name, &self.config.excluded_patterns) {
+                continue;
+            }
+
             // Folder selection. An unselected item is not recorded at all, so
             // in on-demand mode it never appears in the mount — which is what
             // "don't sync this folder" has to mean when nothing is downloaded

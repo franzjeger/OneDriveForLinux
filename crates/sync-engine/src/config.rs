@@ -24,6 +24,14 @@ fn default_poll_interval() -> u64 {
     30
 }
 
+impl Config {
+    /// The default exclusion list, exposed so tests and callers can check
+    /// behaviour against the same set the config ships with.
+    pub fn default_excluded_patterns() -> Vec<String> {
+        default_excluded()
+    }
+}
+
 fn default_excluded() -> Vec<String> {
     vec![
         "*.tmp".into(),
