@@ -474,6 +474,11 @@ impl GraphClient {
         Ok(item)
     }
 
+    /// Threshold above which uploads go through a resumable session.
+    pub const fn large_file_threshold() -> u64 {
+        LARGE_FILE_THRESHOLD
+    }
+
     pub async fn get_upload_session(
         &self,
         parent_id: &str,
@@ -510,19 +515,69 @@ impl GraphClient {
         Ok(session)
     }
 
+    /// Ask Graph how much of an upload session it already holds.
+    ///
+    /// Returns the next byte it expects, or `None` if the session is gone —
+    /// expired, cancelled, or already completed. Sessions live for hours, so a
+    /// transfer interrupted by a closed laptop or a dropped connection can pick
+    /// up where it stopped instead of resending everything.
+    pub async fn upload_session_offset(&self, upload_url: &str) -> Option<u64> {
+        let resp = self.http.get(upload_url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let session: UploadSession = resp.json().await.ok()?;
+        // "bytes 12345-" or "12345-67890" — the first number is what to send next.
+        let first = session.next_expected_ranges?.into_iter().next()?;
+        first
+            .trim_start_matches("bytes ")
+            .split('-')
+            .next()?
+            .parse()
+            .ok()
+    }
+
+    /// Upload the remaining chunks of a session, starting at `start_offset`.
+    pub async fn upload_via_session_from(
+        &self,
+        session: &UploadSession,
+        path: &Path,
+        total_size: u64,
+        start_offset: u64,
+    ) -> GraphResult<DriveItem> {
+        self.upload_chunks(session, path, total_size, start_offset)
+            .await
+    }
+
     async fn upload_via_session(
         &self,
         session: &UploadSession,
         path: &Path,
         total_size: u64,
     ) -> GraphResult<DriveItem> {
+        self.upload_chunks(session, path, total_size, 0).await
+    }
+
+    async fn upload_chunks(
+        &self,
+        session: &UploadSession,
+        path: &Path,
+        total_size: u64,
+        start_offset: u64,
+    ) -> GraphResult<DriveItem> {
         use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncSeekExt;
 
         // Stream the file chunk-by-chunk — this path handles files above the
         // small-upload threshold, which can be arbitrarily large, so the whole
         // file must never be held in memory at once.
         let mut file = tokio::fs::File::open(path).await?;
-        let mut offset: u64 = 0;
+        let mut offset: u64 = start_offset.min(total_size);
+        if offset > 0 {
+            file.seek(std::io::SeekFrom::Start(offset)).await?;
+            let done = offset as f64 / total_size.max(1) as f64 * 100.0;
+            info!("Resuming upload at byte {offset} ({done:.0}% already sent)");
+        }
         let mut buf = vec![0u8; UPLOAD_CHUNK_SIZE];
 
         while offset < total_size {
@@ -831,6 +886,51 @@ mod http_tests {
         assert!(
             !matches!(err, GraphError::ResyncRequired),
             "an unrelated 410 must not trigger a full resync"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_offset_parses_what_graph_still_expects() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        Mock::given(method("GET"))
+            .and(path("/session/abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "uploadUrl": "https://example/session/abc",
+                "nextExpectedRanges": ["26214400-104857599"]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), dir.path());
+        let offset = client
+            .upload_session_offset(&format!("{}/session/abc", server.uri()))
+            .await;
+        assert_eq!(
+            offset,
+            Some(26_214_400),
+            "resuming from the wrong offset corrupts the upload"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gone_session_reports_no_offset() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        Mock::given(method("GET"))
+            .and(path("/session/expired"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), dir.path());
+        // None means "start over", which is the safe reading of a session
+        // Graph no longer has.
+        assert_eq!(
+            client
+                .upload_session_offset(&format!("{}/session/expired", server.uri()))
+                .await,
+            None
         );
     }
 
