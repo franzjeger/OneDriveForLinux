@@ -297,15 +297,39 @@ if [ "$OVERLAY" = 1 ]; then
 
     # Qt only searches the plugin directories in its own library paths — a
     # plugin under $HOME is silently never loaded. Install where Dolphin looks.
+    # Arch and openSUSE keep the Qt 6 tools out of PATH under /usr/lib/qt6/bin,
+    # so looking only at PATH finds nothing on exactly the distributions most
+    # likely to be running Plasma. Search the known locations too.
     QT_PLUGIN_DIR=""
-    for qtpaths in qtpaths6 qtpaths; do
+    for qtpaths in qtpaths6 qtpaths \
+                   /usr/lib/qt6/bin/qtpaths6 /usr/lib/qt6/bin/qtpaths \
+                   /usr/lib64/qt6/bin/qtpaths6 /usr/lib64/qt6/bin/qtpaths \
+                   /usr/libexec/qt6/qtpaths6 /usr/libexec/qt6/qtpaths; do
         if command -v "$qtpaths" >/dev/null 2>&1; then
-            QT_PLUGIN_DIR=$("$qtpaths" --plugin-dir 2>/dev/null) && break
+            candidate=$("$qtpaths" --plugin-dir 2>/dev/null) || continue
+            if [ -n "$candidate" ]; then
+                QT_PLUGIN_DIR="$candidate"
+                break
+            fi
         fi
     done
 
+    # Last resort: the conventional layout next to the Qt 6 libraries. Guessing
+    # beats giving up, because the directory is highly conventional and a wrong
+    # guess only means the plugin does not load — nothing is damaged.
     if [ -z "$QT_PLUGIN_DIR" ]; then
-        overlay_give_up "could not determine the Qt plugin directory (is qtpaths6 installed?)"
+        for candidate in /usr/lib/qt6/plugins /usr/lib64/qt6/plugins \
+                         /usr/lib/x86_64-linux-gnu/qt6/plugins; do
+            if [ -d "$candidate" ]; then
+                QT_PLUGIN_DIR="$candidate"
+                warn "qtpaths not found; assuming Qt plugins live in $QT_PLUGIN_DIR"
+                break
+            fi
+        done
+    fi
+
+    if [ -z "$QT_PLUGIN_DIR" ]; then
+        overlay_give_up "could not locate the Qt 6 plugin directory — install qt6-base and re-run"
     fi
 fi
 
