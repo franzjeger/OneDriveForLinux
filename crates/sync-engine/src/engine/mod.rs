@@ -276,6 +276,22 @@ impl SyncEngine {
 }
 
 impl SyncEngine {
+    /// Item counts per sync state — everything a status display needs, without
+    /// transferring the whole item table.
+    pub async fn get_state_counts(&self) -> Vec<(String, u64)> {
+        self.db.state_counts().await.unwrap_or_default()
+    }
+
+    /// A capped list of items that are syncing, failed, or in conflict.
+    pub async fn get_attention_items(&self, limit: usize) -> Vec<(PathBuf, SyncState)> {
+        self.db
+            .items_needing_attention(limit)
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Every tracked item. Only for callers that genuinely enumerate them
+    /// (`odctl status --all`) — see get_state_counts for status displays.
     pub async fn get_status(&self) -> Vec<(PathBuf, SyncState)> {
         self.db
             .all_items()

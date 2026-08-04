@@ -42,6 +42,33 @@ impl OneDriveInterface {
             .collect())
     }
 
+    /// Item counts keyed by the stored state name (`synced`, `cloud_only`,
+    /// `syncing`, `error`, …). Status displays should use this rather than
+    /// GetStatus: a large drive has hundreds of thousands of items, and
+    /// shipping them all over the bus every couple of seconds to compute three
+    /// numbers is not something the bus, or the database, should be asked to do.
+    async fn get_state_counts(&self) -> zbus::fdo::Result<Vec<(String, u32)>> {
+        Ok(self
+            .engine
+            .get_state_counts()
+            .await
+            .into_iter()
+            .map(|(state, count)| (state, count.min(u32::MAX as u64) as u32))
+            .collect())
+    }
+
+    /// Up to `limit` items that are syncing, failed, or in conflict — the ones
+    /// worth naming in a status display.
+    async fn get_attention_items(&self, limit: u32) -> zbus::fdo::Result<Vec<(String, String)>> {
+        Ok(self
+            .engine
+            .get_attention_items(limit as usize)
+            .await
+            .into_iter()
+            .map(|(path, state)| (path.to_string_lossy().to_string(), state.to_string()))
+            .collect())
+    }
+
     async fn force_sync(&self, path: String) -> zbus::fdo::Result<()> {
         info!("D-Bus: ForceSync {path}");
         let engine = Arc::clone(&self.engine);
