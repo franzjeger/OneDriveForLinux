@@ -403,6 +403,61 @@ impl Database {
         .await
     }
 
+    /// Names of the folders directly inside `sync_dir`.
+    ///
+    /// Matched by prefix and then by "no further slash", so it returns direct
+    /// children only — GLOB's `*` spans separators and cannot express depth.
+    pub async fn top_level_folders(&self, sync_dir: &Path) -> Result<Vec<String>> {
+        let prefix = format!("{}/", sync_dir.to_string_lossy());
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT name FROM items
+                 WHERE is_folder = 1
+                   AND substr(local_path, 1, ?1) = ?2
+                   AND instr(substr(local_path, ?1 + 1), '/') = 0
+                 ORDER BY name COLLATE NOCASE",
+            )?;
+            let names = stmt
+                .query_map(params![prefix.len() as i64, prefix], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(names)
+        })
+        .await
+    }
+
+    /// Delete every item that is not inside one of `folders`.
+    ///
+    /// Comparison is by literal prefix rather than GLOB: folder names come from
+    /// the user's drive and may contain `*`, `?` or `[`, which GLOB would treat
+    /// as wildcards and silently keep the wrong rows.
+    pub async fn delete_items_outside(&self, sync_dir: &Path, folders: &[String]) -> Result<usize> {
+        if folders.is_empty() {
+            return Ok(0);
+        }
+        // For each folder: the folder row itself, or anything beneath it.
+        use rusqlite::types::Value;
+        let mut clauses = Vec::new();
+        let mut args: Vec<Value> = Vec::new();
+        for folder in folders {
+            let exact = sync_dir.join(folder).to_string_lossy().to_string();
+            let prefix = format!("{exact}/");
+            clauses.push("(local_path = ? OR substr(local_path, 1, ?) = ?)");
+            args.push(Value::from(exact));
+            args.push(Value::from(prefix.len() as i64));
+            args.push(Value::from(prefix));
+        }
+        // Keep the sync directory row itself: it is the mount root.
+        clauses.push("local_path = ?");
+        args.push(Value::from(sync_dir.to_string_lossy().to_string()));
+
+        let sql = format!("DELETE FROM items WHERE NOT ({})", clauses.join(" OR "));
+        self.with_conn(move |conn| Ok(conn.execute(&sql, rusqlite::params_from_iter(args.iter()))?))
+            .await
+    }
+
     pub async fn all_items(&self) -> Result<Vec<DbItem>> {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
@@ -1062,6 +1117,92 @@ mod tests {
             plan.contains("COVERING INDEX"),
             "folder-state probe is not index-only; plan was: {plan}"
         );
+    }
+
+    #[tokio::test]
+    async fn top_level_folders_are_direct_children_only() {
+        let (_dir, db) = open_temp_db();
+        for (id, path, folder) in [
+            ("a", "/sync/Kunder", true),
+            ("b", "/sync/Projects", true),
+            ("c", "/sync/Kunder/Acme", true), // nested — must not be listed
+            ("d", "/sync/readme.txt", false), // file — must not be listed
+        ] {
+            let mut item = test_item(id, path);
+            item.is_folder = folder;
+            item.name = Path::new(path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            db.upsert_item(&item).await.unwrap();
+        }
+
+        let folders = db.top_level_folders(Path::new("/sync")).await.unwrap();
+        assert_eq!(folders, vec!["Kunder".to_string(), "Projects".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn deselecting_a_folder_removes_it_and_its_contents() {
+        let (_dir, db) = open_temp_db();
+        for (id, path) in [
+            ("root", "/sync"),
+            ("keep", "/sync/Kunder"),
+            ("keep-child", "/sync/Kunder/Acme/notes.txt"),
+            ("drop", "/sync/Projects"),
+            ("drop-child", "/sync/Projects/plan.docx"),
+        ] {
+            db.upsert_item(&test_item(id, path)).await.unwrap();
+        }
+
+        let removed = db
+            .delete_items_outside(Path::new("/sync"), &["Kunder".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(removed, 2, "only the deselected folder and its contents");
+        assert!(db.get_item_by_id("keep").await.unwrap().is_some());
+        assert!(db.get_item_by_id("keep-child").await.unwrap().is_some());
+        assert!(db.get_item_by_id("drop").await.unwrap().is_none());
+        assert!(db.get_item_by_id("drop-child").await.unwrap().is_none());
+        // The mount root must survive, or the filesystem has nothing to serve.
+        assert!(db.get_item_by_id("root").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn folder_names_are_not_treated_as_glob_patterns() {
+        // Real drives contain folders with [ and * in the name. Matching them
+        // as wildcards would keep or drop the wrong rows.
+        let (_dir, db) = open_temp_db();
+        db.upsert_item(&test_item("odd", "/sync/Report [2026]"))
+            .await
+            .unwrap();
+        db.upsert_item(&test_item("other", "/sync/ReportX2026Y"))
+            .await
+            .unwrap();
+
+        let removed = db
+            .delete_items_outside(Path::new("/sync"), &["Report [2026]".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(db.get_item_by_id("odd").await.unwrap().is_some());
+        assert!(db.get_item_by_id("other").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_empty_selection_deletes_nothing() {
+        let (_dir, db) = open_temp_db();
+        db.upsert_item(&test_item("a", "/sync/x")).await.unwrap();
+        // Empty means "sync everything" — it must never be read as "keep none".
+        assert_eq!(
+            db.delete_items_outside(Path::new("/sync"), &[])
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(db.get_item_by_id("a").await.unwrap().is_some());
     }
 
     #[tokio::test]

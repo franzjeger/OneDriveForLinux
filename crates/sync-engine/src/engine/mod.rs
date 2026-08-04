@@ -143,6 +143,11 @@ impl SyncEngine {
             });
         }
 
+        // Apply the folder selection before anything else: a folder deselected
+        // in settings should be gone by the time the mount is served, not after
+        // the next sync pass.
+        self.prune_unselected().await;
+
         // Upload retry queue — drains failed uploads regardless of mode, since
         // both the FUSE write path and the local watcher feed it.
         let engine_uploads = Arc::clone(&self);
@@ -276,6 +281,62 @@ impl SyncEngine {
 }
 
 impl SyncEngine {
+    /// Whether an item belongs to the selected set of folders.
+    ///
+    /// An empty `sync_folders` means everything, which is the default. A
+    /// non-empty list names top-level folders to keep; anything else is not
+    /// recorded at all, so in on-demand mode it does not appear in the mount.
+    /// The sync directory itself is always in, or the mount would have no root.
+    pub fn is_selected(&self, local_path: &Path) -> bool {
+        if self.config.sync_folders.is_empty() || local_path == self.config.sync_dir {
+            return true;
+        }
+        self.config
+            .sync_folders
+            .iter()
+            .any(|folder| local_path.starts_with(self.config.sync_dir.join(folder)))
+    }
+
+    /// Forget everything outside the current selection, and drop the cache
+    /// files that went with it.
+    ///
+    /// Run at startup: the settings view restarts the daemon after a change, so
+    /// this is where a newly deselected folder actually disappears. Deselecting
+    /// removes only our records and cached copies — the files stay on OneDrive.
+    pub async fn prune_unselected(&self) {
+        if self.config.sync_folders.is_empty() {
+            return;
+        }
+        let removed = match self
+            .db
+            .delete_items_outside(&self.config.sync_dir, &self.config.sync_folders)
+            .await
+        {
+            Ok(removed) => removed,
+            Err(e) => {
+                error!("Could not apply the folder selection: {e}");
+                return;
+            }
+        };
+        if removed > 0 {
+            info!(
+                "Folder selection: dropped {removed} items outside {:?}",
+                self.config.sync_folders
+            );
+            // Their cached copies are now orphaned; cleanup_cache removes any
+            // cache file without a database row.
+            self.cleanup_cache().await;
+        }
+    }
+
+    /// Top-level folder names, for a selection UI.
+    pub async fn top_level_folders(&self) -> Vec<String> {
+        self.db
+            .top_level_folders(&self.config.sync_dir)
+            .await
+            .unwrap_or_default()
+    }
+
     /// Item counts per sync state — everything a status display needs, without
     /// transferring the whole item table.
     pub async fn get_state_counts(&self) -> Vec<(String, u64)> {

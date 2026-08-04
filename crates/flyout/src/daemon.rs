@@ -19,6 +19,7 @@ pub trait OneDriveControl {
     fn needs_auth(&self) -> zbus::Result<bool>;
     fn get_progress(&self) -> zbus::Result<String>;
     fn pending_uploads(&self) -> zbus::Result<u32>;
+    fn top_level_folders(&self) -> zbus::Result<Vec<String>>;
     fn start_auth(&self) -> zbus::Result<(String, String, String)>;
 }
 
@@ -130,6 +131,15 @@ impl DaemonClient {
                 .collect();
         }
         snap
+    }
+
+    /// Folder names at the top of the drive, for the settings view. Empty when
+    /// the daemon is unreachable or the first sync has not listed them yet.
+    pub fn top_level_folders(&self) -> Vec<String> {
+        self.proxy
+            .as_ref()
+            .and_then(|p| p.top_level_folders().ok())
+            .unwrap_or_default()
     }
 
     /// Kick off the device-code flow. Returns (message, user code, url).

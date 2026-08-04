@@ -15,6 +15,7 @@ A native OneDrive client for Linux featuring:
 - **Dolphin overlay icons** — sync-state emblems on file icons in KDE's file manager, so you can see at a glance what is on disk and what is still in the cloud. Opt in with `--with-dolphin-overlay` (see `extensions/dolphin/README.md`)
 - **Installs as a desktop app** — an entry in the application menu and KRunner, a tray icon, and autostart at login; the terminal is never required after install
 - **Status flyout** — left-click the tray icon for a window with live status, storage usage, and recent activity; expired sign-ins are fixed in two clicks with a graphical device-code flow
+- **Selective sync** — choose which top-level folders to sync; the rest never appear on this computer and stay untouched on OneDrive
 - **The cache stays within bounds** — files you open are kept for next time, and once past `max_cache_size_gb` the least recently used are removed again; never pinned files, and never anything still waiting to upload
 - **Uploads are never dropped** — a failed upload is queued in the database, retried with backoff, and survives a daemon restart; you are notified only if it is given up on
 - **Desktop notifications** for the three things that need you: sign-in expired, an upload given up on, a conflicting edit set aside
@@ -103,6 +104,7 @@ client_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 # on_demand = true              # enable Files On-Demand via FUSE
 # delta_poll_interval_secs = 30 # how often to poll for remote changes
 # max_cache_size_gb = 10        # cap on the on-demand cache; 0 = unlimited
+# sync_folders = ["Documents", "Projects"]  # only these top-level folders; omit for all
 # max_upload_threads = 4
 # max_download_threads = 4
 # excluded_patterns = ["*.tmp", "~$*", ".~lock.*", "desktop.ini", "thumbs.db"]
