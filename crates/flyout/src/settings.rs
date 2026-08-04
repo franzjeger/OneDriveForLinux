@@ -13,6 +13,8 @@ pub struct Settings {
     pub sync_dir: String,
     pub on_demand: bool,
     pub poll_interval_secs: u64,
+    /// Ceiling on the on-demand file cache, in GB. 0 means unlimited.
+    pub max_cache_size_gb: f64,
     pub auth_method: String,
     /// One glob per line, as shown in the text box.
     pub excluded_patterns: String,
@@ -24,6 +26,7 @@ impl Default for Settings {
             sync_dir: default_sync_dir(),
             on_demand: true,
             poll_interval_secs: 30,
+            max_cache_size_gb: 10.0,
             auth_method: "auto".into(),
             excluded_patterns: ["*.tmp", "~$*", ".~lock.*", "desktop.ini", "thumbs.db"].join("\n"),
         }
@@ -78,6 +81,11 @@ pub fn load() -> Result<Settings> {
             .and_then(|v| v.as_integer())
             .map(|v| v.max(1) as u64)
             .unwrap_or(defaults.poll_interval_secs),
+        max_cache_size_gb: doc
+            .get("max_cache_size_gb")
+            .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
+            .map(|v| v.max(0.0))
+            .unwrap_or(defaults.max_cache_size_gb),
         auth_method: doc
             .get("auth_method")
             .and_then(|v| v.as_str())
@@ -116,6 +124,10 @@ pub fn save(settings: &Settings) -> Result<()> {
     doc.insert(
         "delta_poll_interval_secs".into(),
         (settings.poll_interval_secs.max(1) as i64).into(),
+    );
+    doc.insert(
+        "max_cache_size_gb".into(),
+        settings.max_cache_size_gb.max(0.0).into(),
     );
     doc.insert("auth_method".into(), settings.auth_method.clone().into());
     doc.insert(
@@ -179,6 +191,7 @@ mod tests {
                 .unwrap_or("auto")
                 .into(),
             excluded_patterns: String::new(),
+            max_cache_size_gb: 10.0,
         };
         edit(&mut settings);
         doc.insert("sync_dir".into(), settings.sync_dir.trim().into());
@@ -207,6 +220,23 @@ mod tests {
     fn poll_interval_never_saves_as_zero() {
         let doc = round_trip("client_id = \"a\"\n", |s| s.poll_interval_secs = 0);
         assert_eq!(doc["delta_poll_interval_secs"].as_integer(), Some(1));
+    }
+
+    #[test]
+    fn cache_limit_never_saves_as_negative() {
+        let mut doc: toml::Table = toml::from_str("client_id = \"a\"\n").unwrap();
+        doc.insert("max_cache_size_gb".into(), (-5.0f64).max(0.0).into());
+        assert_eq!(doc["max_cache_size_gb"].as_float(), Some(0.0));
+    }
+
+    #[test]
+    fn cache_limit_reads_an_integer_written_by_hand() {
+        // toml distinguishes 20 from 20.0, and people edit this file directly.
+        let doc: toml::Table = toml::from_str("max_cache_size_gb = 20\n").unwrap();
+        let parsed = doc
+            .get("max_cache_size_gb")
+            .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)));
+        assert_eq!(parsed, Some(20.0));
     }
 
     #[test]

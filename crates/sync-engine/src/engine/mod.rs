@@ -25,6 +25,7 @@ use std::{
 use tokio::sync::{broadcast, Mutex as TokioMutex, RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 
+mod cache;
 mod delta;
 mod local;
 mod pin;

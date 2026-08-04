@@ -45,3 +45,35 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  overlay-plugin:
+    name: Dolphin overlay plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The plugin is C++ against KDE Frameworks 6 and is built by
+      # install.sh --with-dolphin-overlay, so nothing else in CI touches it.
+      # Without this job a configure or compile error only surfaces on a user's
+      # machine, which is exactly how it happened: kcoreaddons_add_plugin()
+      # aborted on an unset CMAKE_LIBRARY_OUTPUT_DIRECTORY and took four rounds
+      # of back-and-forth to find.
+      - name: Install KDE Frameworks 6 build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake extra-cmake-modules \
+            qt6-base-dev libkf6kio-dev libkf6coreaddons-dev
+
+      - name: Configure
+        run: cmake -S extensions/dolphin -B build-overlay -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build-overlay -j"$(nproc)"
+
+      - name: Confirm the plugin was produced
+        run: |
+          # A green build that emits no shared object would be a silent failure.
+          found=$(find build-overlay -name 'onedrive-overlay.so' | head -n 1)
+          test -n "$found" || { echo "no onedrive-overlay.so was built"; exit 1; }
+          echo "built $found"
