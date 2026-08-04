@@ -38,6 +38,12 @@ fn default_sync_folders() -> Vec<String> {
     vec![]
 }
 
+/// Files On-Demand downloads every file you open into the cache. Without a
+/// ceiling the cache only ever grows, which defeats the point of the mode.
+fn default_max_cache_size_gb() -> f64 {
+    10.0
+}
+
 fn default_auth_method() -> String {
     "auto".into()
 }
@@ -81,6 +87,12 @@ pub struct Config {
     /// Seconds between delta polls.
     #[serde(default = "default_poll_interval")]
     pub delta_poll_interval_secs: u64,
+
+    /// Upper bound on the on-demand file cache, in GB. When the cache exceeds
+    /// this, the least recently used files are evicted — never pinned files,
+    /// and never files whose upload has not completed. `0` disables the limit.
+    #[serde(default = "default_max_cache_size_gb")]
+    pub max_cache_size_gb: f64,
 
     /// How to sign in: "auto" (browser when a desktop session is present),
     /// "browser" (authorization code + PKCE — required when Conditional
@@ -138,6 +150,7 @@ impl Config {
             max_upload_threads: 4,
             max_download_threads: 4,
             delta_poll_interval_secs: 30,
+            max_cache_size_gb: default_max_cache_size_gb(),
             auth_method: default_auth_method(),
         };
         cfg.save()
@@ -164,6 +177,7 @@ mod tests {
         assert_eq!(cfg.max_upload_threads, 4);
         assert_eq!(cfg.max_download_threads, 4);
         assert_eq!(cfg.delta_poll_interval_secs, 30);
+        assert_eq!(cfg.max_cache_size_gb, 10.0);
         assert!(cfg.excluded_patterns.contains(&"*.tmp".to_string()));
         assert!(cfg.sync_folders.is_empty());
     }

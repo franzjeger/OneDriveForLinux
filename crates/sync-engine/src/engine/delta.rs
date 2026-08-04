@@ -597,6 +597,10 @@ impl SyncEngine {
         // Prune item_locks: remove entries where we're the only holder of the Arc.
         self.item_locks.retain(|_, v| Arc::strong_count(v) > 1);
 
+        // Removing orphans only reclaims space for files that left OneDrive.
+        // Everything still in the drive stays cached forever without this.
+        self.enforce_cache_limit().await;
+
         if removed > 0 {
             let mb = removed_bytes as f64 / (1024.0 * 1024.0);
             info!("Cache cleanup: removed {removed} stale files ({mb:.1} MB)");
@@ -625,6 +629,7 @@ mod delta_tests {
             max_upload_threads: 1,
             max_download_threads: 1,
             delta_poll_interval_secs: 30,
+            max_cache_size_gb: 10.0,
             auth_method: "device_code".into(),
         });
         let dir = tempfile::tempdir().unwrap();

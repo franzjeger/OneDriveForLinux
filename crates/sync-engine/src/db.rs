@@ -486,6 +486,20 @@ impl Database {
         .await
     }
 
+    /// IDs of every queued upload. Their cache files hold edits that have not
+    /// reached OneDrive, so they must never be evicted.
+    pub async fn queued_upload_ids(&self) -> Result<std::collections::HashSet<String>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare("SELECT item_id FROM upload_queue")?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(ids)
+        })
+        .await
+    }
+
     pub async fn dequeue_upload(&self, item_id: &str) -> Result<()> {
         let item_id = item_id.to_string();
         self.with_conn(move |conn| {

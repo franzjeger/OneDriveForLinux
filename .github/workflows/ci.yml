@@ -45,3 +45,37 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  overlay-plugin:
+    name: Dolphin overlay plugin
+    runs-on: ubuntu-latest
+    # Ubuntu 24.04 has no KF6 development packages, so the plugin is built in
+    # an Arch container instead — which also matches the distribution people
+    # actually run Plasma 6 on.
+    container: archlinux:latest
+    steps:
+      # Before checkout: actions/checkout needs git present in the container.
+      - name: Install KDE Frameworks 6 build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel cmake extra-cmake-modules kio qt6-base git
+
+      - uses: actions/checkout@v7
+
+      # The plugin is C++ against KDE Frameworks 6 and is built only by
+      # install.sh --with-dolphin-overlay, so nothing else in CI touches it.
+      # Without this job a configure or compile error surfaces first on a
+      # user's machine — which is how kcoreaddons_add_plugin() aborting on an
+      # unset CMAKE_LIBRARY_OUTPUT_DIRECTORY took four rounds to find.
+      - name: Configure
+        run: cmake -S extensions/dolphin -B build-overlay -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build-overlay -j"$(nproc)"
+
+      - name: Confirm the plugin was produced
+        run: |
+          # A green build that emits no shared object would be a silent failure.
+          found=$(find build-overlay -name 'onedrive-overlay.so' | head -n 1)
+          test -n "$found" || { echo "no onedrive-overlay.so was built"; exit 1; }
+          echo "built $found"
