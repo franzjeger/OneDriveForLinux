@@ -31,13 +31,43 @@ impl SyncEngine {
     ///
     /// Returns the number of bytes freed.
     pub async fn enforce_cache_limit(&self) -> u64 {
-        let Some(cache_dir) = &self.cache_dir else {
-            return 0;
-        };
         if self.config.max_cache_size_gb <= 0.0 {
             return 0; // Explicitly unlimited.
         }
         let limit = (self.config.max_cache_size_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+        self.evict_down_to(limit, MIN_AGE_SECS).await
+    }
+
+    /// Bytes currently held by the on-demand cache.
+    pub async fn cache_usage(&self) -> u64 {
+        let Some(cache_dir) = &self.cache_dir else {
+            return 0;
+        };
+        let Ok(dir) = std::fs::read_dir(cache_dir) else {
+            return 0;
+        };
+        dir.flatten()
+            .filter_map(|e| e.metadata().ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum()
+    }
+
+    /// Evict everything that can be evicted, right now.
+    ///
+    /// Asked for explicitly, so the age grace does not apply: someone who
+    /// chooses "free up space" means now, not "in an hour". Pinned files and
+    /// files with an unsent edit are still never touched.
+    pub async fn free_up_space(&self) -> u64 {
+        self.evict_down_to(0, 0).await
+    }
+
+    /// Shared eviction: bring the cache down to `limit` bytes, sparing files
+    /// used within `min_age_secs`.
+    async fn evict_down_to(&self, limit: u64, min_age_secs: u64) -> u64 {
+        let Some(cache_dir) = &self.cache_dir else {
+            return 0;
+        };
 
         // Protected sets, loaded once: pinned files are the user saying "keep
         // this", and a queued upload's cache file holds an edit that exists
@@ -75,10 +105,11 @@ impl SyncEngine {
                 .chain(meta.modified().ok())
                 .max()
                 .unwrap_or(now);
-            if now
-                .duration_since(last_used)
-                .map(|age| age.as_secs() < MIN_AGE_SECS)
-                .unwrap_or(true)
+            if min_age_secs > 0
+                && now
+                    .duration_since(last_used)
+                    .map(|age| age.as_secs() < min_age_secs)
+                    .unwrap_or(true)
             {
                 continue;
             }
@@ -120,8 +151,7 @@ impl SyncEngine {
 
         if freed > 0 {
             let mb = freed as f64 / (1024.0 * 1024.0);
-            let limit_gb = self.config.max_cache_size_gb;
-            info!("Cache over {limit_gb} GB — evicted {mb:.1} MB of least recently used files");
+            info!("Evicted {mb:.1} MB of least recently used cache files");
         } else {
             // Everything above the limit was pinned, queued, or too recent.
             // Say so: silently staying over the limit looks like the setting
@@ -213,6 +243,15 @@ mod tests {
         let chosen = plan_evictions(candidates, 300, 250);
         assert_eq!(chosen.len(), 1, "freeing 50 bytes should cost one file");
         assert_eq!(chosen[0].item_id, "a");
+    }
+
+    #[test]
+    fn an_explicit_free_up_takes_everything_evictable() {
+        // free_up_space() passes limit 0, so nothing survives on size grounds.
+        // What it must still respect is the protection list, which is applied
+        // before candidates are ever built.
+        let candidates = vec![candidate("a", 100, 10), candidate("b", 100, 10_000)];
+        assert_eq!(plan_evictions(candidates, 200, 0).len(), 2);
     }
 
     #[test]

@@ -98,6 +98,28 @@ impl OneDriveInterface {
         Ok(self.engine.pending_uploads().await as u32)
     }
 
+    /// Bytes the on-demand cache is currently using.
+    async fn cache_usage(&self) -> zbus::fdo::Result<u64> {
+        Ok(self.engine.cache_usage().await)
+    }
+
+    /// Drop every cached file that can be dropped, and report the bytes freed.
+    /// Pinned files and files with an unsent edit are kept.
+    async fn free_up_space(&self) -> zbus::fdo::Result<u64> {
+        Ok(self.engine.free_up_space().await)
+    }
+
+    /// Items kept on this device: (path, size in bytes).
+    async fn get_pinned(&self) -> zbus::fdo::Result<Vec<(String, u64)>> {
+        Ok(self
+            .engine
+            .pinned(50)
+            .await
+            .into_iter()
+            .map(|(path, size)| (path.to_string_lossy().to_string(), size))
+            .collect())
+    }
+
     /// Files changed both here and on OneDrive: (path in the mount, path of
     /// the preserved local copy — empty if it could not be kept).
     async fn get_conflicts(&self) -> zbus::fdo::Result<Vec<(String, String)>> {

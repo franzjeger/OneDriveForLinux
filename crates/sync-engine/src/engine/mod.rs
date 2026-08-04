@@ -342,6 +342,17 @@ impl SyncEngine {
         }
     }
 
+    /// Items the user has pinned, for a "kept on this device" list.
+    pub async fn pinned(&self, limit: usize) -> Vec<(PathBuf, u64)> {
+        self.db
+            .pinned_items(limit)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| (item.local_path, item.size))
+            .collect()
+    }
+
     /// Files changed in both places, for a review UI.
     pub async fn conflicts(&self, limit: usize) -> Vec<(PathBuf, String)> {
         self.db
