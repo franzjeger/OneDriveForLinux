@@ -1,5 +1,6 @@
 mod dbus;
 mod notify;
+mod quota;
 
 use anyhow::{Context, Result};
 use fuse3::{raw::Session, MountOptions};

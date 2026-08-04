@@ -14,10 +14,10 @@ pub type ProgressText = Arc<Mutex<String>>;
 
 pub struct OneDriveInterface {
     pub engine: Arc<SyncEngine>,
-    pub graph: Arc<GraphClient>,
     pub recent: RecentBuffer,
     pub needs_auth: Arc<std::sync::atomic::AtomicBool>,
     pub progress: ProgressText,
+    pub quota: crate::quota::QuotaCache,
 }
 
 #[interface(name = "com.onedrive.linux1")]
@@ -104,17 +104,12 @@ impl OneDriveInterface {
     }
 
     /// Storage quota as (used, total) bytes. (0, 0) when unknown.
+    /// Used and total bytes on the drive, served from a short-lived cache.
+    /// Status displays poll this every couple of seconds; asking Graph each
+    /// time would be thousands of requests an hour against a throttled API for
+    /// a number that barely moves.
     async fn get_quota(&self) -> zbus::fdo::Result<(u64, u64)> {
-        match self.graph.get_drive().await {
-            Ok(drive) => {
-                let q = drive.quota.unwrap_or_default();
-                Ok((q.used, q.total))
-            }
-            Err(e) => {
-                tracing::warn!("GetQuota: {e}");
-                Ok((0, 0))
-            }
-        }
+        Ok(self.quota.get().await)
     }
 
     /// Most recent item activity, newest first: (path, state, unix seconds).
@@ -167,16 +162,18 @@ pub async fn export_dbus(
     needs_auth: Arc<std::sync::atomic::AtomicBool>,
     progress: ProgressText,
 ) -> anyhow::Result<Connection> {
+    // The interface reaches Graph only through this cache.
+    let quota = crate::quota::QuotaCache::new(graph);
     let conn = Connection::session().await?;
     conn.object_server()
         .at(
             "/com/onedrive/linux1",
             OneDriveInterface {
                 engine,
-                graph,
                 recent,
                 needs_auth,
                 progress,
+                quota,
             },
         )
         .await?;
