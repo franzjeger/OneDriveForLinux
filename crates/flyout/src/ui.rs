@@ -51,6 +51,10 @@ pub struct FlyoutApp {
     /// Set once the compositor has granted focus — see the dismissal logic in
     /// `update`.
     has_been_focused: bool,
+    /// Bytes freed by the last "Free up space", and when. Shown briefly so the
+    /// click has a visible result — freeing nothing looks identical to the
+    /// button doing nothing at all.
+    freed_notice: Option<(u64, Instant)>,
     /// True when opened from the tray icon (`--flyout`), where clicking
     /// elsewhere should dismiss the window. Launched from the application menu
     /// it is an ordinary window and must stay put until closed.
@@ -81,6 +85,7 @@ impl FlyoutApp {
             last_fetch: Instant::now(),
             view: View::Status,
             has_been_focused: false,
+            freed_notice: None,
             starting_since: starting.then(Instant::now),
             dismiss_on_blur: std::env::args().any(|a| a == "--flyout"),
         };
@@ -503,6 +508,7 @@ Sync resumes automatically.",
             let (color, text) = self.headline();
             let mut sign_in_clicked = false;
             let mut settings_clicked = false;
+            let mut toggle_pin: Option<(String, bool)> = None;
             ui.horizontal(|ui| {
                 ui.label(RichText::new("☁").size(24.0).color(ACCENT));
                 ui.vertical(|ui| {
@@ -597,6 +603,95 @@ Sync resumes automatically.",
                 ui.separator();
             }
 
+            // ── On this device ────────────────────────────────────────
+            // Files On-Demand is about controlling what is on disk, and until
+            // now the only ways to do that were Dolphin's context menu and
+            // odctl. Both live outside the app that owns the setting.
+            let mut free_space_clicked = false;
+            let mut unpin: Option<String> = None;
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("ON THIS DEVICE")
+                        .size(10.5)
+                        .color(MUTED)
+                        .strong(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(
+                            s.cache_usage > 0,
+                            egui::Button::new("Free up space").small(),
+                        )
+                        .on_hover_text(
+                            "Removes downloaded copies that are safe to remove. Pinned files \
+                             and anything still waiting to upload are kept.",
+                        )
+                        .clicked()
+                    {
+                        free_space_clicked = true;
+                    }
+                    ui.label(
+                        RichText::new(human_bytes(s.cache_usage))
+                            .color(MUTED)
+                            .size(11.5),
+                    );
+                });
+            });
+
+            if let Some((freed, at)) = self.freed_notice {
+                if at.elapsed() < Duration::from_secs(8) {
+                    let text = if freed > 0 {
+                        format!("Freed {}", human_bytes(freed))
+                    } else {
+                        "Nothing could be freed — everything cached is pinned, waiting to \
+                         upload, or in use."
+                            .to_string()
+                    };
+                    let colour = if freed > 0 { GOOD } else { MUTED };
+                    ui.label(RichText::new(text).color(colour).size(11.0));
+                }
+            }
+
+            if s.pinned.is_empty() {
+                ui.label(
+                    RichText::new(
+                        "Nothing is pinned. Right-click a file in your file manager and choose \
+                         \"Always keep on this device\" to keep it available offline.",
+                    )
+                    .color(MUTED)
+                    .size(11.0),
+                );
+            } else {
+                for (path, size) in s.pinned.clone().iter().take(4) {
+                    let name = std::path::Path::new(path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.clone());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("📌").size(11.0));
+                        ui.label(RichText::new(&name).size(12.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .small_button("Unpin")
+                                .on_hover_text("Stop keeping this on the device")
+                                .clicked()
+                            {
+                                unpin = Some(path.clone());
+                            }
+                            ui.label(RichText::new(human_bytes(*size)).color(MUTED).size(11.0));
+                        });
+                    });
+                }
+                if s.pinned.len() > 4 {
+                    ui.label(
+                        RichText::new(format!("… and {} more pinned", s.pinned.len() - 4))
+                            .color(MUTED)
+                            .size(11.0),
+                    );
+                }
+            }
+            ui.separator();
+
             // ── Recent activity ───────────────────────────────────────
             ui.label(
                 RichText::new("RECENT ACTIVITY")
@@ -608,7 +703,7 @@ Sync resumes automatically.",
                 if s.recent.is_empty() {
                     ui.label(RichText::new("No activity yet.").color(MUTED));
                 }
-                for (name, parent, state, ts) in s.recent.clone() {
+                for (full_path, name, parent, state, ts) in s.recent.clone() {
                     let (chip_color, chip_text) = state_chip(&state);
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
@@ -621,6 +716,21 @@ Sync resumes automatically.",
                             );
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Acting on a file you just saw change is the most
+                            // likely reason to open this window at all.
+                            let is_pinned = state == "Pinned";
+                            let label = if is_pinned { "Unpin" } else { "Pin" };
+                            if ui
+                                .small_button(label)
+                                .on_hover_text(if is_pinned {
+                                    "Stop keeping this on the device"
+                                } else {
+                                    "Always keep this on the device"
+                                })
+                                .clicked()
+                            {
+                                toggle_pin = Some((full_path.clone(), !is_pinned));
+                            }
                             egui::Frame::none()
                                 .fill(chip_color.gamma_multiply(0.16))
                                 .rounding(Rounding::same(8.0))
@@ -663,6 +773,18 @@ Sync resumes automatically.",
                     });
                 });
 
+            if free_space_clicked {
+                self.freed_notice = Some((self.client.free_up_space(), Instant::now()));
+                self.snap = self.client.fetch();
+            }
+            if let Some(path) = unpin {
+                self.client.set_pinned(&path, false);
+                self.snap = self.client.fetch();
+            }
+            if let Some((path, pin)) = toggle_pin {
+                self.client.set_pinned(&path, pin);
+                self.snap = self.client.fetch();
+            }
             if settings_clicked {
                 self.open_settings();
             }

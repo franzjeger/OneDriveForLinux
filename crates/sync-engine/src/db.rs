@@ -379,6 +379,27 @@ impl Database {
         .await
     }
 
+    /// Pinned items, for a "kept on this device" list.
+    pub async fn pinned_items(&self, limit: usize) -> Result<Vec<DbItem>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, local_path, name, parent_id, etag, ctag, size,
+                        modified_at, created_at, sha1_hash, quick_xor_hash,
+                        is_folder, is_placeholder, sync_state, pinned
+                 FROM items WHERE pinned = 1
+                 ORDER BY name COLLATE NOCASE
+                 LIMIT ?1",
+            )?;
+            let mut rows = stmt.query(params![limit as i64])?;
+            let mut items = Vec::new();
+            while let Some(row) = rows.next()? {
+                items.push(row_to_item(row)?);
+            }
+            Ok(items)
+        })
+        .await
+    }
+
     /// Items currently in conflict, newest first, capped for display.
     pub async fn conflicted_items(&self, limit: usize) -> Result<Vec<DbItem>> {
         self.with_conn(move |conn| {
@@ -1185,6 +1206,35 @@ mod tests {
             plan.contains("COVERING INDEX"),
             "folder-state probe is not index-only; plan was: {plan}"
         );
+    }
+
+    #[tokio::test]
+    async fn pinned_items_lists_only_pinned() {
+        let (_dir, db) = open_temp_db();
+        db.upsert_item(&test_item("plain", "/sync/a.txt"))
+            .await
+            .unwrap();
+        db.upsert_item(&test_item("kept", "/sync/b.txt"))
+            .await
+            .unwrap();
+        db.set_pinned("kept", true).await.unwrap();
+
+        let pinned = db.pinned_items(10).await.unwrap();
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0].id, "kept");
+    }
+
+    #[tokio::test]
+    async fn pinned_items_respects_its_limit() {
+        let (_dir, db) = open_temp_db();
+        for n in 0..6 {
+            let id = format!("p{n}");
+            db.upsert_item(&test_item(&id, &format!("/sync/f{n}")))
+                .await
+                .unwrap();
+            db.set_pinned(&id, true).await.unwrap();
+        }
+        assert_eq!(db.pinned_items(2).await.unwrap().len(), 2);
     }
 
     #[tokio::test]

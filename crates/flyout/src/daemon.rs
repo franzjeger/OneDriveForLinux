@@ -21,6 +21,11 @@ pub trait OneDriveControl {
     fn pending_uploads(&self) -> zbus::Result<u32>;
     fn top_level_folders(&self) -> zbus::Result<Vec<String>>;
     fn get_conflicts(&self) -> zbus::Result<Vec<(String, String)>>;
+    fn cache_usage(&self) -> zbus::Result<u64>;
+    fn free_up_space(&self) -> zbus::Result<u64>;
+    fn get_pinned(&self) -> zbus::Result<Vec<(String, u64)>>;
+    fn pin_item(&self, path: String) -> zbus::Result<()>;
+    fn unpin_item(&self, path: String) -> zbus::Result<()>;
     fn start_auth(&self) -> zbus::Result<(String, String, String)>;
 }
 
@@ -41,8 +46,13 @@ pub struct Snapshot {
     pub pending_uploads: u32,
     /// Files changed in both places: (path in the mount, preserved local copy).
     pub conflicts: Vec<(String, String)>,
-    /// (file name, parent dir, state, unix seconds)
-    pub recent: Vec<(String, String, String, i64)>,
+    /// Bytes the on-demand cache is using.
+    pub cache_usage: u64,
+    /// Items kept on this device: (path, size).
+    pub pinned: Vec<(String, u64)>,
+    /// (full path, file name, parent dir, state, unix seconds). The full path
+    /// is kept so the UI can act on a row, not only describe it.
+    pub recent: Vec<(String, String, String, String, i64)>,
 }
 
 /// systemd user unit installed by install.sh.
@@ -116,6 +126,8 @@ impl DaemonClient {
         if snap.errors > 0 {
             snap.conflicts = proxy.get_conflicts().unwrap_or_default();
         }
+        snap.cache_usage = proxy.cache_usage().unwrap_or(0);
+        snap.pinned = proxy.get_pinned().unwrap_or_default();
         if let Ok((used, total)) = proxy.get_quota() {
             snap.quota_used = used;
             snap.quota_total = total;
@@ -134,7 +146,7 @@ impl DaemonClient {
                         .and_then(|d| d.file_name())
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    (name, parent, state, ts)
+                    (path, name, parent, state, ts)
                 })
                 .collect();
         }
@@ -153,6 +165,25 @@ impl DaemonClient {
     /// Kick off the device-code flow. Returns (message, user code, url).
     pub fn start_auth(&self) -> Option<(String, String, String)> {
         self.proxy.as_ref().and_then(|p| p.start_auth().ok())
+    }
+
+    /// Keep an item on this device, or stop keeping it.
+    pub fn set_pinned(&self, path: &str, pinned: bool) {
+        if let Some(proxy) = &self.proxy {
+            let _ = if pinned {
+                proxy.pin_item(path.to_string())
+            } else {
+                proxy.unpin_item(path.to_string())
+            };
+        }
+    }
+
+    /// Drop cached copies that are safe to drop. Returns bytes freed.
+    pub fn free_up_space(&self) -> u64 {
+        self.proxy
+            .as_ref()
+            .and_then(|p| p.free_up_space().ok())
+            .unwrap_or(0)
     }
 
     pub fn set_paused(&self, pause: bool) {
