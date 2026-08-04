@@ -143,6 +143,19 @@ impl Database {
             [],
         );
 
+        // Covering index for the folder-aggregate probes behind every folder's
+        // sync-state emblem. idx_items_local_path alone gets the prefix range
+        // from the index but then fetches each row from the table to test
+        // is_folder/sync_state/pinned. Carrying those columns in the index makes
+        // the probes index-only (EXPLAIN QUERY PLAN reports COVERING INDEX),
+        // which matters because a folder whose descendants are all cloud-only
+        // has to walk the whole subtree before it can answer "no".
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_items_subtree_state
+                 ON items(local_path, is_folder, sync_state, pinned)",
+            [],
+        );
+
         Ok(())
     }
 
@@ -1019,6 +1032,36 @@ mod tests {
             .unwrap();
         db.dequeue_upload("d").await.unwrap();
         assert_eq!(db.pending_upload_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn folder_aggregate_probes_use_the_covering_index() {
+        // The emblem for every visible folder goes through these probes, and a
+        // folder whose descendants are all cloud-only has to walk the whole
+        // subtree to answer. Without the covering index each row visit also
+        // costs a table lookup; this asserts the planner stays index-only.
+        let (_dir, db) = open_temp_db();
+        let plan = db
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "EXPLAIN QUERY PLAN
+                     SELECT 1 FROM items
+                     WHERE local_path GLOB ?1 AND is_folder = 0
+                       AND sync_state != 'cloud_only'
+                     LIMIT 1",
+                )?;
+                let rows: Vec<String> = stmt
+                    .query_map(params!["/sync/folder/*"], |row| row.get::<_, String>(3))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(rows.join(" | "))
+            })
+            .await
+            .unwrap();
+        assert!(
+            plan.contains("COVERING INDEX"),
+            "folder-state probe is not index-only; plan was: {plan}"
+        );
     }
 
     #[tokio::test]
