@@ -83,6 +83,7 @@ impl SyncEngine {
             let cache_dir = cache_dir.clone();
             let item_local_path = db_item.local_path.clone();
             let id = db_item.id.clone();
+            let etag = db_item.etag.clone();
             let remaining = Arc::clone(&remaining);
             let sem = Arc::clone(&sem);
             let lock = self.item_lock(&id);
@@ -92,7 +93,12 @@ impl SyncEngine {
                 let _guard = lock.lock().await;
                 let cache_path = cache_dir.join(&id);
                 if !cache_path.exists() {
-                    match graph.download_file(&id, &cache_path).await {
+                    // Pinning a folder can mean many large files; each one
+                    // resumes rather than restarting if the run is interrupted.
+                    match graph
+                        .download_file_resumable(&id, &cache_path, etag.as_deref())
+                        .await
+                    {
                         Ok(_) => {
                             if let Err(e) = db.set_placeholder(&id, false).await {
                                 warn!("Pin: failed to clear placeholder for {id}: {e}");

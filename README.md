@@ -18,7 +18,7 @@ A native OneDrive client for Linux featuring:
 - **Status flyout** — left-click the tray icon for a window with live status, storage usage, and recent activity; expired sign-ins are fixed in two clicks with a graphical device-code flow
 - **Selective sync** — choose which top-level folders to sync; the rest never appear on this computer and stay untouched on OneDrive
 - **The cache stays within bounds** — files you open are kept for next time, and once past `max_cache_size_gb` the least recently used are removed again; never pinned files, and never anything still waiting to upload
-- **Large uploads resume** — an interrupted transfer continues from where it stopped rather than restarting, even across a daemon restart
+- **Large transfers resume in both directions** — an interrupted upload or download continues from where it stopped rather than restarting, even across a daemon restart
 - **Uploads are never dropped** — a failed upload is queued in the database, retried with backoff, and survives a daemon restart; you are notified only if it is given up on
 - **Desktop notifications** for the three things that need you: sign-in expired, an upload given up on, a conflicting edit set aside
 - **Offline is not an error** — the tray says "Offline, waiting for a connection" instead of showing a failure you cannot act on
