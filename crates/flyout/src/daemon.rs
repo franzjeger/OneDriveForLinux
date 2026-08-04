@@ -20,6 +20,7 @@ pub trait OneDriveControl {
     fn get_progress(&self) -> zbus::Result<String>;
     fn pending_uploads(&self) -> zbus::Result<u32>;
     fn top_level_folders(&self) -> zbus::Result<Vec<String>>;
+    fn get_conflicts(&self) -> zbus::Result<Vec<(String, String)>>;
     fn start_auth(&self) -> zbus::Result<(String, String, String)>;
 }
 
@@ -38,6 +39,8 @@ pub struct Snapshot {
     pub progress: String,
     /// Edits queued for upload that have not reached OneDrive yet.
     pub pending_uploads: u32,
+    /// Files changed in both places: (path in the mount, preserved local copy).
+    pub conflicts: Vec<(String, String)>,
     /// (file name, parent dir, state, unix seconds)
     pub recent: Vec<(String, String, String, i64)>,
 }
@@ -107,6 +110,11 @@ impl DaemonClient {
                 "error" | "conflict" => snap.errors += count,
                 _ => {}
             }
+        }
+        // Only fetched when something is actually conflicted, so the common
+        // case costs nothing.
+        if snap.errors > 0 {
+            snap.conflicts = proxy.get_conflicts().unwrap_or_default();
         }
         if let Ok((used, total)) = proxy.get_quota() {
             snap.quota_used = used;

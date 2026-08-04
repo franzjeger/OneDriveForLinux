@@ -147,6 +147,10 @@ impl GraphClient {
                             tokio::time::sleep(std::time::Duration::from_secs(retry_secs)).await;
                         }
                         404 => return Err(GraphError::NotFound(status.to_string())),
+                        // Our If-Match precondition failed: the item changed on
+                        // OneDrive. Retrying would just fail again, and dropping
+                        // the precondition would overwrite someone's change.
+                        412 => return Err(GraphError::Conflict),
                         500 | 502 | 503 | 504 => {
                             if attempt > MAX_RETRIES {
                                 return Err(GraphError::Api {
@@ -400,11 +404,28 @@ impl GraphClient {
         name: &str,
         path: &Path,
     ) -> GraphResult<DriveItem> {
+        self.upload_file_if_match(parent_id, name, path, None).await
+    }
+
+    /// Upload, optionally only if the remote item still has `if_match` as its
+    /// ETag.
+    ///
+    /// Without the precondition an upload is last-writer-wins: if the file
+    /// changed on OneDrive after we last synced it, we overwrite that change
+    /// and nobody is told. With it, Graph answers 412 and the caller can keep
+    /// both versions instead.
+    pub async fn upload_file_if_match(
+        &self,
+        parent_id: &str,
+        name: &str,
+        path: &Path,
+        if_match: Option<&str>,
+    ) -> GraphResult<DriveItem> {
         let metadata = tokio::fs::metadata(path).await?;
         let size = metadata.len();
 
         if size <= LARGE_FILE_THRESHOLD {
-            self.upload_small(parent_id, name, path).await
+            self.upload_small(parent_id, name, path, if_match).await
         } else {
             let session = self.get_upload_session(parent_id, name, size).await?;
             self.upload_via_session(&session, path, size).await
@@ -416,6 +437,7 @@ impl GraphClient {
         parent_id: &str,
         name: &str,
         path: &Path,
+        if_match: Option<&str>,
     ) -> GraphResult<DriveItem> {
         let url = format!(
             "{}/me/drive/items/{parent_id}:/{}:/content",
@@ -433,15 +455,16 @@ impl GraphClient {
                 let url = url.clone();
                 async move {
                     let token = self.bearer().await?;
-                    let resp = self
+                    let mut req = self
                         .http
                         .put(&url)
                         .bearer_auth(&token)
                         .header("Content-Type", "application/octet-stream")
-                        .header("Content-Length", content_length.to_string())
-                        .body(data)
-                        .send()
-                        .await?;
+                        .header("Content-Length", content_length.to_string());
+                    if let Some(etag) = if_match {
+                        req = req.header("If-Match", etag);
+                    }
+                    let resp = req.body(data).send().await?;
                     Ok(resp)
                 }
             })

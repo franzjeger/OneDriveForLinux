@@ -98,6 +98,18 @@ impl OneDriveInterface {
         Ok(self.engine.pending_uploads().await as u32)
     }
 
+    /// Files changed both here and on OneDrive: (path in the mount, path of
+    /// the preserved local copy — empty if it could not be kept).
+    async fn get_conflicts(&self) -> zbus::fdo::Result<Vec<(String, String)>> {
+        Ok(self
+            .engine
+            .conflicts(50)
+            .await
+            .into_iter()
+            .map(|(path, kept)| (path.to_string_lossy().to_string(), kept))
+            .collect())
+    }
+
     /// Names of the folders at the top of the drive, for a selection UI.
     async fn top_level_folders(&self) -> zbus::fdo::Result<Vec<String>> {
         Ok(self.engine.top_level_folders().await)

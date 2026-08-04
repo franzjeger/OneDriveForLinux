@@ -889,7 +889,20 @@ impl Filesystem for OneDriveFS {
                     // the kernel doesn't block the calling process (e.g. Dolphin).
                     tokio::spawn(async move {
                         if let Some(parent_id) = item.parent_id.clone() {
-                            match graph.upload_file(&parent_id, &item.name, &cache_path).await {
+                            // If-Match on the ETag we last synced. Without it an
+                            // upload is last-writer-wins: a file changed on
+                            // OneDrive since we downloaded it would be silently
+                            // overwritten, and the other change lost.
+                            let expected_etag = item.etag.clone();
+                            match graph
+                                .upload_file_if_match(
+                                    &parent_id,
+                                    &item.name,
+                                    &cache_path,
+                                    expected_etag.as_deref(),
+                                )
+                                .await
+                            {
                                 Ok(updated) => {
                                     let new_size = updated.size.unwrap_or_else(|| {
                                         std::fs::metadata(&cache_path).map(|m| m.len()).unwrap_or(0)
@@ -918,6 +931,32 @@ impl Filesystem for OneDriveFS {
                                         "upload complete: {} ({} bytes)",
                                         updated_item.name, new_size
                                     );
+                                }
+                                // The file changed on OneDrive since we last
+                                // saw it. Both versions are real work, so keep
+                                // both: the user's edit is preserved in the
+                                // cache under a conflict name, and the next
+                                // delta brings the remote version back down.
+                                Err(graph_client::GraphError::Conflict) => {
+                                    let conflict_name = conflict_copy_name(&item.name);
+                                    let conflict_path =
+                                        cache_path.with_file_name(format!("conflict-{}", item.id));
+                                    if let Err(e) = std::fs::copy(&cache_path, &conflict_path) {
+                                        error!(
+                                            "conflict on {}: could not preserve the local copy: {e}",
+                                            item.name
+                                        );
+                                    }
+                                    warn!(
+                                        "conflict on {}: it changed on OneDrive too; \
+                                         your version kept as {conflict_name}",
+                                        item.name
+                                    );
+                                    if let Err(e) =
+                                        db.set_sync_state(&item.id, &SyncState::Conflict).await
+                                    {
+                                        error!("could not mark {} conflicted: {e}", item.name);
+                                    }
                                 }
                                 Err(e) => {
                                     // Do not let the edit disappear: queue it
@@ -1487,5 +1526,40 @@ mod xattr_reply_tests {
                 "wrong length reported for {state:?}"
             );
         }
+    }
+}
+
+/// Name used for the copy kept when a file changed in both places.
+///
+/// The timestamp keeps repeated conflicts from overwriting one another, which
+/// would defeat the point of preserving the user's version at all.
+fn conflict_copy_name(name: &str) -> String {
+    let stamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => format!("{stem} (conflicted copy {stamp}).{ext}"),
+        _ => format!("{name} (conflicted copy {stamp})"),
+    }
+}
+
+#[cfg(test)]
+mod conflict_name_tests {
+    use super::conflict_copy_name;
+
+    #[test]
+    fn keeps_the_extension_so_the_file_still_opens() {
+        let name = conflict_copy_name("budget.ods");
+        assert!(name.starts_with("budget (conflicted copy "));
+        assert!(name.ends_with(".ods"), "got {name}");
+    }
+
+    #[test]
+    fn handles_names_without_an_extension() {
+        assert!(conflict_copy_name("NOTES").starts_with("NOTES (conflicted copy "));
+    }
+
+    #[test]
+    fn a_leading_dot_is_not_an_extension() {
+        // ".bashrc" is a name, not an empty stem with a "bashrc" extension.
+        assert!(conflict_copy_name(".bashrc").starts_with(".bashrc (conflicted copy "));
     }
 }
