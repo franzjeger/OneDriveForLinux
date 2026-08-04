@@ -18,6 +18,9 @@ pub struct Settings {
     pub auth_method: String,
     /// One glob per line, as shown in the text box.
     pub excluded_patterns: String,
+    /// Top-level folders to sync. Empty means all of them, which is the
+    /// default and what most people want.
+    pub sync_folders: Vec<String>,
 }
 
 impl Default for Settings {
@@ -29,6 +32,7 @@ impl Default for Settings {
             max_cache_size_gb: 10.0,
             auth_method: "auto".into(),
             excluded_patterns: ["*.tmp", "~$*", ".~lock.*", "desktop.ini", "thumbs.db"].join("\n"),
+            sync_folders: Vec::new(),
         }
     }
 }
@@ -91,6 +95,15 @@ pub fn load() -> Result<Settings> {
             .and_then(|v| v.as_str())
             .map(String::from)
             .unwrap_or(defaults.auth_method),
+        sync_folders: doc
+            .get("sync_folders")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or(defaults.sync_folders),
         excluded_patterns: doc
             .get("excluded_patterns")
             .and_then(|v| v.as_array())
@@ -130,6 +143,16 @@ pub fn save(settings: &Settings) -> Result<()> {
         settings.max_cache_size_gb.max(0.0).into(),
     );
     doc.insert("auth_method".into(), settings.auth_method.clone().into());
+    doc.insert(
+        "sync_folders".into(),
+        toml::Value::Array(
+            settings
+                .sync_folders
+                .iter()
+                .map(|f| toml::Value::String(f.clone()))
+                .collect(),
+        ),
+    );
     doc.insert(
         "excluded_patterns".into(),
         toml::Value::Array(
@@ -192,6 +215,7 @@ mod tests {
                 .into(),
             excluded_patterns: String::new(),
             max_cache_size_gb: 10.0,
+            sync_folders: Vec::new(),
         };
         edit(&mut settings);
         doc.insert("sync_dir".into(), settings.sync_dir.trim().into());

@@ -19,16 +19,22 @@ const REFRESH: Duration = Duration::from_secs(2);
 /// daemon, before admitting it did not come up.
 const STARTUP_GRACE: Duration = Duration::from_secs(15);
 
+/// State of the settings view. Boxed inside `View` because it is far larger
+/// than the other variants, and an enum is sized by its biggest one.
+struct SettingsView {
+    draft: Settings,
+    /// What the file held when the view opened — used to detect edits.
+    original: Settings,
+    /// Top-level folder names offered as checkboxes, read once on open.
+    folders: Vec<String>,
+    /// Result banner shown after a save attempt.
+    status: Option<Result<String, String>>,
+}
+
 enum View {
     Status,
     /// Editing config.toml through real controls rather than a text editor.
-    Settings {
-        draft: Settings,
-        /// What the file held when the view opened — used to detect edits.
-        original: Settings,
-        /// Result banner shown after a save attempt.
-        status: Option<Result<String, String>>,
-    },
+    Settings(Box<SettingsView>),
     /// Device-code sign-in: message, user code, verification URL.
     SignIn {
         user_code: String,
@@ -99,11 +105,12 @@ impl FlyoutApp {
                 Some(Err(format!("Could not read the config file: {e}"))),
             ),
         };
-        self.view = View::Settings {
+        self.view = View::Settings(Box::new(SettingsView {
+            folders: self.client.top_level_folders(),
             original: draft.clone(),
             draft,
             status,
-        };
+        }));
     }
 
     fn begin_sign_in(&mut self) {
@@ -241,12 +248,13 @@ Sync resumes automatically.",
             return;
         }
 
-        if let View::Settings {
-            draft,
-            original,
-            status,
-        } = &mut self.view
-        {
+        if let View::Settings(view) = &mut self.view {
+            let SettingsView {
+                draft,
+                original,
+                folders,
+                status,
+            } = view.as_mut();
             let mut close = false;
             let mut save = false;
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -299,6 +307,89 @@ Sync resumes automatically.",
                             egui::Slider::new(&mut draft.poll_interval_secs, 10..=600)
                                 .suffix(" s")
                                 .text("interval"),
+                        );
+                        ui.add_space(6.0);
+
+                        ui.label(
+                            RichText::new("FOLDERS TO SYNC")
+                                .size(10.5)
+                                .color(MUTED)
+                                .strong(),
+                        );
+                        if folders.is_empty() {
+                            ui.label(
+                                RichText::new(
+                                    "The folder list appears once the first sync has listed \
+                                     your drive.",
+                                )
+                                .color(MUTED)
+                                .size(11.0),
+                            );
+                        } else {
+                            // An empty sync_folders means "everything", so the
+                            // "All folders" tick and the list are two views of
+                            // the same value rather than two settings.
+                            let mut all = draft.sync_folders.is_empty();
+                            if ui.checkbox(&mut all, "All folders").changed() {
+                                draft.sync_folders = if all {
+                                    Vec::new()
+                                } else {
+                                    // Start from everything ticked, so nothing
+                                    // vanishes until something is deselected.
+                                    folders.clone()
+                                };
+                            }
+                            if !draft.sync_folders.is_empty() {
+                                ui.indent("folder_list", |ui| {
+                                    for folder in folders.iter() {
+                                        let mut on = draft.sync_folders.contains(folder);
+                                        if ui.checkbox(&mut on, folder).changed() {
+                                            if on {
+                                                draft.sync_folders.push(folder.clone());
+                                            } else {
+                                                draft.sync_folders.retain(|f| f != folder);
+                                            }
+                                            // Deselecting the last one would
+                                            // mean "everything" — keep it on.
+                                            if draft.sync_folders.is_empty() {
+                                                draft.sync_folders.push(folder.clone());
+                                            }
+                                        }
+                                    }
+                                });
+                                ui.label(
+                                    RichText::new(
+                                        "Folders you turn off are removed from this computer. \
+                                         They stay on OneDrive, and come back if you turn them \
+                                         on again.",
+                                    )
+                                    .color(WARN)
+                                    .size(11.0),
+                                );
+                            }
+                        }
+                        ui.add_space(6.0);
+
+                        ui.label(
+                            RichText::new("KEEP AT MOST")
+                                .size(10.5)
+                                .color(MUTED)
+                                .strong(),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut draft.max_cache_size_gb, 0.0..=200.0)
+                                .suffix(" GB")
+                                .text("on disk"),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Files you open are kept for next time. Past this size the ones \
+                                 you have not touched in a while are removed again — never \
+                                 pinned files, and never anything still waiting to upload. \
+                                 0 means no limit.",
+                            )
+                            .color(MUTED)
+                            .size(11.0),
                         );
                         ui.add_space(6.0);
 

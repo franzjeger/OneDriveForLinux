@@ -98,6 +98,11 @@ impl OneDriveInterface {
         Ok(self.engine.pending_uploads().await as u32)
     }
 
+    /// Names of the folders at the top of the drive, for a selection UI.
+    async fn top_level_folders(&self) -> zbus::fdo::Result<Vec<String>> {
+        Ok(self.engine.top_level_folders().await)
+    }
+
     /// True when the daemon is waiting for the user to re-authenticate.
     async fn needs_auth(&self) -> zbus::fdo::Result<bool> {
         Ok(self.needs_auth.load(std::sync::atomic::Ordering::Relaxed))

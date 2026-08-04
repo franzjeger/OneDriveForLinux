@@ -151,6 +151,19 @@ impl SyncEngine {
                 continue;
             }
 
+            // Folder selection. An unselected item is not recorded at all, so
+            // in on-demand mode it never appears in the mount — which is what
+            // "don't sync this folder" has to mean when nothing is downloaded
+            // until it is opened. It stays untouched on OneDrive.
+            if !self.config.sync_folders.is_empty() {
+                match self.item_local_path(&item) {
+                    Ok(local_path) if !self.is_selected(&local_path) => continue,
+                    // A path we cannot resolve is left to the normal path below
+                    // rather than silently dropped.
+                    _ => {}
+                }
+            }
+
             // On-demand, unpinned items are pure metadata: a folder row or a
             // cloud-only placeholder. Neither touches the filesystem, so they
             // can go straight into the batch.
@@ -168,20 +181,6 @@ impl SyncEngine {
                             path: local_path,
                             state,
                         });
-                        continue;
-                    }
-                }
-            }
-
-            // Items outside sync_folders need only a DB record — batch them.
-            if !self.config.on_demand && !self.config.sync_folders.is_empty() {
-                if let Ok(local_path) = self.item_local_path(&item) {
-                    let in_sync_folder =
-                        self.config.sync_folders.iter().any(|folder| {
-                            local_path.starts_with(self.config.sync_dir.join(folder))
-                        });
-                    if !in_sync_folder {
-                        db_batch.push(self.drive_item_to_db(&item, &local_path, true));
                         continue;
                     }
                 }
@@ -239,24 +238,6 @@ impl SyncEngine {
         }
 
         let local_path = self.item_local_path(item)?;
-
-        // sync_folders filter: when set, only download items whose local path is
-        // under one of the configured top-level folders. Items outside are stored
-        // in the DB as cloud-only so they appear in the FUSE mount but are never
-        // written to disk. Only applies in non-on_demand mode.
-        if !self.config.on_demand && !self.config.sync_folders.is_empty() {
-            let in_sync_folder = self
-                .config
-                .sync_folders
-                .iter()
-                .any(|folder| local_path.starts_with(self.config.sync_dir.join(folder)));
-            if !in_sync_folder {
-                // Record in DB but do not download.
-                let db_item = self.drive_item_to_db(item, &local_path, true);
-                self.db.upsert_item(&db_item).await?;
-                return Ok(());
-            }
-        }
 
         if item.is_folder() {
             // In on_demand mode the FUSE fs is mounted at sync_dir — don't write
