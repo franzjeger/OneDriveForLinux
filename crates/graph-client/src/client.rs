@@ -69,8 +69,12 @@ impl GraphClient {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_base_url(auth: Arc<AuthManager>, base_url: String) -> Self {
+    /// Point the client at a mock server instead of Graph.
+    ///
+    /// Available to other crates' tests through the `test-util` feature, so the
+    /// integration test can drive the real HTTP paths without the network.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn with_base_url(auth: Arc<AuthManager>, base_url: String) -> Self {
         let mut client = Self::new(auth);
         client.base_url = base_url;
         client

@@ -281,6 +281,16 @@ impl SyncEngine {
 }
 
 impl SyncEngine {
+    /// Run one delta pass to completion and return.
+    ///
+    /// [`start`](Self::start) spawns loops that never return, which is right
+    /// for the daemon and useless for anything that needs to observe the result
+    /// of a single pass — a "sync now" command, or a test asserting on what
+    /// landed in the database.
+    pub async fn sync_once(&self) -> anyhow::Result<()> {
+        self.run_delta_sync().await
+    }
+
     /// Whether an item belongs to the selected set of folders.
     ///
     /// An empty `sync_folders` means everything, which is the default. A

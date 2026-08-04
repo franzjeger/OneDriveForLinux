@@ -35,7 +35,11 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Tests
-        run: cargo test --workspace
+        # ONEDRIVE_REQUIRE_FUSE turns the mount round trip's "skipped, no FUSE
+        # here" escape hatch into a failure. Without it a runner image that
+        # stopped shipping /dev/fuse would quietly reduce the only end-to-end
+        # test to a no-op, and CI would stay green.
+        run: ONEDRIVE_REQUIRE_FUSE=1 cargo test --workspace
 
   audit:
     name: Security audit

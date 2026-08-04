@@ -4579,10 +4579,13 @@ dependencies = [
  "graph-client",
  "libc",
  "serde",
+ "serde_json",
  "sync-engine",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
