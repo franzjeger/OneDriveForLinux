@@ -1173,16 +1173,6 @@ impl Filesystem for OneDriveFS {
             return Err(libc::ENODATA.into());
         }
 
-        // fuse3 bug (v0.7.3): ReplyXAttr::Size encodes error=+ERANGE in the reply header,
-        // but the Linux FUSE driver rejects any reply with error > 0 as EINVAL, which
-        // aborts the FUSE connection. Avoid ReplyXAttr::Size entirely.
-        // Dolphin's KOverlayIconPlugin always passes a fixed 63-byte buffer (size > 0),
-        // so it never triggers this path. Tools like getfattr do size=0 probes — return
-        // ENODATA so they fail cleanly without crashing the FUSE session.
-        if size == 0 {
-            return Err(libc::ENODATA.into());
-        }
-
         let item_id = {
             let map = self.inodes.read().await;
             map.get(&inode).map(|e| e.item_id.clone())
@@ -1226,6 +1216,24 @@ impl Filesystem for OneDriveFS {
         };
 
         let bytes = state_str.as_bytes();
+
+        // A zero size is the caller asking how long the value is, before
+        // allocating. Every standard reader does this first — getfattr, Python's
+        // os.getxattr on a long value, most libraries — so failing it makes the
+        // attribute effectively unreadable outside our own plugin.
+        //
+        // fuse3 answers that with ReplyXAttr::Size, which sets a *positive*
+        // errno (ERANGE) in the reply header. Linux treats any positive error as
+        // malformed, turns it into EIO, and logs "unknown error"; still true in
+        // fuse3 0.9.0. So encode the reply by hand: the kernel wants exactly a
+        // fuse_getxattr_out { size: u32, padding: u32 } with error = 0, which is
+        // what ReplyXAttr::Data with those eight bytes produces.
+        if size == 0 {
+            return Ok(ReplyXAttr::Data(bytes::Bytes::copy_from_slice(
+                &encode_xattr_size(bytes.len() as u32),
+            )));
+        }
+
         if size < bytes.len() as u32 {
             return Err(libc::ERANGE.into());
         }
@@ -1381,5 +1389,47 @@ impl Filesystem for OneDriveFS {
         Ok(ReplyData {
             data: bytes::Bytes::from(entry.target.clone().into_bytes()),
         })
+    }
+}
+
+/// Encode a `struct fuse_getxattr_out { u32 size; u32 padding; }` for a
+/// zero-size getxattr probe.
+///
+/// FUSE structs are native-endian and this one is exactly the eight bytes the
+/// kernel expects back when a caller asks for the length of an attribute.
+/// Written out here because fuse3's own `ReplyXAttr::Size` sets a positive
+/// errno in the reply header, which Linux rejects.
+fn encode_xattr_size(len: u32) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&len.to_ne_bytes());
+    out
+}
+
+#[cfg(test)]
+mod xattr_reply_tests {
+    use super::encode_xattr_size;
+
+    /// The kernel reads these eight bytes as `fuse_getxattr_out`, so the layout
+    /// has to be exact: length in the first four bytes, padding zeroed.
+    #[test]
+    fn size_probe_reply_matches_fuse_getxattr_out() {
+        let encoded = encode_xattr_size(6); // "synced"
+        assert_eq!(encoded.len(), 8, "fuse_getxattr_out is 8 bytes");
+        assert_eq!(u32::from_ne_bytes(encoded[..4].try_into().unwrap()), 6);
+        assert_eq!(&encoded[4..], &[0, 0, 0, 0], "padding must be zeroed");
+    }
+
+    #[test]
+    fn every_state_length_round_trips() {
+        for state in [
+            "synced", "syncing", "cloud", "error", "local", "conflict", "pinned", "partial",
+        ] {
+            let encoded = encode_xattr_size(state.len() as u32);
+            assert_eq!(
+                u32::from_ne_bytes(encoded[..4].try_into().unwrap()),
+                state.len() as u32,
+                "wrong length reported for {state:?}"
+            );
+        }
     }
 }

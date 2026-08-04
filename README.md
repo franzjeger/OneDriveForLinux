@@ -285,6 +285,8 @@ crates/
 
 **"You are not authorized to execute this file"** when using the OneDrive right-click menu in Dolphin — Plasma refuses to run a service menu whose `.desktop` file is not executable. Fix it with `chmod +x ~/.local/share/kio/servicemenus/onedrive.desktop`, or re-run the installer (v0.5.1 and later set the bit).
 
+**Checking a file's sync state by hand** — `getfattr -n user.onedrive.syncstate ~/OneDrive/some-file`. This requires v0.7.1 or later; before that the filesystem rejected the zero-size length probe every standard xattr reader starts with, so the attribute read as "No such attribute" even though it was being served correctly to the Dolphin plugin.
+
 **No sync-state emblems in Dolphin** — the overlay plugin is opt-in, because it is C++ and needs the KDE Frameworks 6 development packages. Re-run the installer with `--with-dolphin-overlay`, then restart Dolphin (`kquitapp6 dolphin`). To check what the filesystem reports for a file without the plugin: `getfattr -n user.onedrive.syncstate ~/OneDrive/some-file`.
 
 **No "OneDrive" entry in the application menu** — some desktops cache the menu. Run `update-desktop-database ~/.local/share/applications` and log out and back in. Verify the entry exists at `~/.local/share/applications/onedrive-linux.desktop`.
