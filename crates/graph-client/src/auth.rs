@@ -107,8 +107,8 @@ impl AuthManager {
 
     /// Test-only constructor with a pre-seeded token and isolated token path,
     /// so tests never touch the real config directory or the network.
-    #[cfg(test)]
-    pub(crate) fn for_tests(token: TokenSet, token_path: PathBuf) -> Self {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn for_tests(token: TokenSet, token_path: PathBuf) -> Self {
         Self {
             client_id: "test-client".into(),
             tenant_id: "common".into(),
