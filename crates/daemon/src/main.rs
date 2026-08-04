@@ -132,6 +132,7 @@ async fn main() -> Result<()> {
             Arc::clone(&graph),
             mountpoint.clone(),
             cache_dir(),
+            config.excluded_patterns.clone(),
         )
         .await
         .context("create FUSE filesystem")?;

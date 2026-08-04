@@ -458,6 +458,53 @@ impl Database {
             .await
     }
 
+    /// Remove items whose name matches an exclusion pattern.
+    ///
+    /// Matching happens in Rust rather than SQL: the patterns are ours, and
+    /// SQLite's GLOB would give different answers for names containing `[` or
+    /// `?`. Only id and name are read, so this stays cheap on a large drive.
+    pub async fn delete_excluded_items(&self, patterns: &[String]) -> Result<usize> {
+        if patterns.is_empty() {
+            return Ok(0);
+        }
+        let patterns = patterns.to_vec();
+        self.with_conn(move |conn| {
+            let mut doomed: Vec<String> = Vec::new();
+            {
+                let mut stmt = conn.prepare("SELECT id, name FROM items")?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let name: String = row.get(1)?;
+                    if crate::filters::is_excluded_name(&name, &patterns) {
+                        doomed.push(row.get(0)?);
+                    }
+                }
+            }
+            if doomed.is_empty() {
+                return Ok(0);
+            }
+            conn.execute_batch("BEGIN")?;
+            let result: Result<()> = (|| {
+                let mut stmt = conn.prepare("DELETE FROM items WHERE id = ?1")?;
+                for id in &doomed {
+                    stmt.execute(params![id])?;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    conn.execute_batch("COMMIT")?;
+                    Ok(doomed.len())
+                }
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(e)
+                }
+            }
+        })
+        .await
+    }
+
     pub async fn all_items(&self) -> Result<Vec<DbItem>> {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(
@@ -1117,6 +1164,40 @@ mod tests {
             plan.contains("COVERING INDEX"),
             "folder-state probe is not index-only; plan was: {plan}"
         );
+    }
+
+    #[tokio::test]
+    async fn adding_a_pattern_removes_what_it_already_matches() {
+        let (_dir, db) = open_temp_db();
+        for (id, path, name) in [
+            ("keep", "/sync/report.docx", "report.docx"),
+            ("tmp", "/sync/draft.tmp", "draft.tmp"),
+            ("lock", "/sync/.~lock.budget.ods#", ".~lock.budget.ods#"),
+        ] {
+            let mut item = test_item(id, path);
+            item.name = name.into();
+            db.upsert_item(&item).await.unwrap();
+        }
+
+        let removed = db
+            .delete_excluded_items(&["*.tmp".to_string(), ".~lock.*".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(removed, 2);
+        assert!(db.get_item_by_id("keep").await.unwrap().is_some());
+        assert!(db.get_item_by_id("tmp").await.unwrap().is_none());
+        assert!(db.get_item_by_id("lock").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn no_patterns_removes_nothing() {
+        let (_dir, db) = open_temp_db();
+        let mut item = test_item("a", "/sync/draft.tmp");
+        item.name = "draft.tmp".into();
+        db.upsert_item(&item).await.unwrap();
+        assert_eq!(db.delete_excluded_items(&[]).await.unwrap(), 0);
+        assert!(db.get_item_by_id("a").await.unwrap().is_some());
     }
 
     #[tokio::test]

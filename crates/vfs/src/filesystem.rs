@@ -80,6 +80,10 @@ pub struct OneDriveFS {
     open_files: RwLock<BTreeMap<u64, std::fs::File>>,
     /// file handles that have had write() called — uploaded on release()
     dirty_fhs: RwLock<HashSet<u64>>,
+    /// Names never uploaded — editor lock files, temporary artefacts and the
+    /// like. In on-demand mode the local watcher does not run, so this is the
+    /// only place the exclusions are enforced on the way out.
+    excluded_patterns: Vec<String>,
     /// Short-lived cache of folder aggregate states, keyed by item ID.
     ///
     /// A file manager showing sync-state emblems asks for this attribute on
@@ -108,6 +112,7 @@ impl OneDriveFS {
         graph: Arc<GraphClient>,
         sync_dir: std::path::PathBuf,
         cache_dir: std::path::PathBuf,
+        excluded_patterns: Vec<String>,
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&cache_dir)
             .map_err(|e| anyhow::anyhow!("create cache dir {:?}: {e}", cache_dir))?;
@@ -124,6 +129,7 @@ impl OneDriveFS {
             id_to_inode: RwLock::new(BTreeMap::new()),
             open_files: RwLock::new(BTreeMap::new()),
             dirty_fhs: RwLock::new(HashSet::new()),
+            excluded_patterns,
             folder_state_cache: RwLock::new(HashMap::new()),
             fh_counter: AtomicU64::new(1),
             sync_dir,
@@ -869,6 +875,12 @@ impl Filesystem for OneDriveFS {
 
             if let Some(id) = item_id {
                 if let Ok(Some(item)) = self.db.get_item_by_id(&id).await {
+                    // Excluded names are written and read locally as normal;
+                    // they simply never leave the machine.
+                    if sync_engine::is_excluded_name(&item.name, &self.excluded_patterns) {
+                        debug!("Not uploading excluded file: {}", item.name);
+                        return Ok(());
+                    }
                     let cache_path = self.cache_dir.join(&id);
                     let graph = Arc::clone(&self.graph);
                     let db = Arc::clone(&self.db);

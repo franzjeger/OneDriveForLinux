@@ -304,6 +304,19 @@ impl SyncEngine {
     /// this is where a newly deselected folder actually disappears. Deselecting
     /// removes only our records and cached copies — the files stay on OneDrive.
     pub async fn prune_unselected(&self) {
+        // Exclusions have the same problem as the folder selection: adding a
+        // pattern should also remove what it now matches, not just stop new
+        // items arriving.
+        match self
+            .db
+            .delete_excluded_items(&self.config.excluded_patterns)
+            .await
+        {
+            Ok(n) if n > 0 => info!("Exclusions: dropped {n} previously-synced items"),
+            Ok(_) => {}
+            Err(e) => error!("Could not apply exclusions: {e}"),
+        }
+
         if self.config.sync_folders.is_empty() {
             return;
         }
@@ -464,27 +477,7 @@ impl SyncEngine {
 
     fn is_excluded(&self, path: &Path) -> bool {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        self.config
-            .excluded_patterns
-            .iter()
-            .any(|p| name_matches_pattern(name, p))
-    }
-}
-
-/// Simple glob matching: only supports leading/trailing wildcards.
-/// Case-insensitive, since OneDrive itself is case-insensitive and Windows
-/// artifacts vary in casing (e.g. `Thumbs.db` vs `thumbs.db`).
-fn name_matches_pattern(name: &str, pattern: &str) -> bool {
-    let name = name.to_lowercase();
-    let pattern = pattern.to_lowercase();
-    if let Some(inner) = pattern.strip_prefix('*').and_then(|p| p.strip_suffix('*')) {
-        name.contains(inner)
-    } else if let Some(suffix) = pattern.strip_prefix('*') {
-        name.ends_with(suffix)
-    } else if let Some(prefix) = pattern.strip_suffix('*') {
-        name.starts_with(prefix)
-    } else {
-        name == pattern
+        crate::filters::is_excluded_name(name, &self.config.excluded_patterns)
     }
 }
 
@@ -495,46 +488,5 @@ trait PathExt {
 impl PathExt for Path {
     fn file_extension_str(&self) -> Option<&str> {
         self.extension().and_then(|e| e.to_str())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::name_matches_pattern;
-
-    #[test]
-    fn exact_match() {
-        assert!(name_matches_pattern("desktop.ini", "desktop.ini"));
-        assert!(!name_matches_pattern("desktop.ini.bak", "desktop.ini"));
-    }
-
-    #[test]
-    fn suffix_wildcard() {
-        assert!(name_matches_pattern("notes.tmp", "*.tmp"));
-        assert!(!name_matches_pattern("notes.txt", "*.tmp"));
-    }
-
-    #[test]
-    fn prefix_wildcard() {
-        assert!(name_matches_pattern("~$report.docx", "~$*"));
-        assert!(name_matches_pattern(".~lock.file.odt", ".~lock.*"));
-        assert!(!name_matches_pattern("report.docx", "~$*"));
-    }
-
-    #[test]
-    fn contains_wildcard() {
-        assert!(name_matches_pattern("a.partial.download", "*partial*"));
-        assert!(!name_matches_pattern("complete.download", "*partial*"));
-    }
-
-    #[test]
-    fn case_insensitive() {
-        assert!(name_matches_pattern("Thumbs.db", "thumbs.db"));
-        assert!(name_matches_pattern("NOTES.TMP", "*.tmp"));
-    }
-
-    #[test]
-    fn bare_star_matches_everything() {
-        assert!(name_matches_pattern("anything", "*"));
     }
 }
