@@ -345,16 +345,24 @@ impl GraphClient {
     // ── Download ───────────────────────────────────────────────────────────────
 
     pub async fn download_file(&self, item_id: &str, dest: &Path) -> GraphResult<()> {
+        self.download_file_resumable(item_id, dest, None).await
+    }
+
+    /// Download, continuing a previous partial transfer when one is present.
+    ///
+    /// `etag` is what we believe the remote content to be. It is sent as
+    /// `If-Range`, so the server resumes only if the file is still that
+    /// version and otherwise sends the whole thing — appending to a partial
+    /// copy of a *different* version would produce a corrupt file that looks
+    /// complete.
+    pub async fn download_file_resumable(
+        &self,
+        item_id: &str,
+        dest: &Path,
+        etag: Option<&str>,
+    ) -> GraphResult<()> {
         let url = format!("{}/me/drive/items/{item_id}/content", self.base_url);
         debug!("download_file({item_id}) -> {dest:?}");
-
-        let resp = self
-            .request_with_retry(|| async {
-                let token = self.bearer().await?;
-                let resp = self.http.get(&url).bearer_auth(&token).send().await?;
-                Ok(resp)
-            })
-            .await?;
 
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -368,8 +376,47 @@ impl GraphClient {
             dest.extension().and_then(|e| e.to_str()).unwrap_or("")
         ));
 
+        // How much of a previous attempt survives. Only worth resuming when we
+        // can name the version it belongs to.
+        let have = match (etag, tokio::fs::metadata(&tmp_path).await) {
+            (Some(_), Ok(meta)) if meta.len() > 0 => meta.len(),
+            _ => 0,
+        };
+
+        let resp = self
+            .request_with_retry(|| async {
+                let token = self.bearer().await?;
+                let mut req = self.http.get(&url).bearer_auth(&token);
+                if have > 0 {
+                    req = req
+                        .header("Range", format!("bytes={have}-"))
+                        .header("If-Range", etag.unwrap_or_default());
+                }
+                let resp = req.send().await?;
+                Ok(resp)
+            })
+            .await?;
+
+        // 206 means the server honoured the range; anything else is a full body
+        // and must replace what we had rather than extend it.
+        let resuming = have > 0 && resp.status().as_u16() == 206;
+        if have > 0 {
+            if resuming {
+                info!("Resuming download of {item_id} at byte {have}");
+            } else {
+                debug!("Server sent the whole file; discarding the partial copy");
+            }
+        }
+
         let result = async {
-            let mut file = tokio::fs::File::create(&tmp_path).await?;
+            let mut file = if resuming {
+                tokio::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&tmp_path)
+                    .await?
+            } else {
+                tokio::fs::File::create(&tmp_path).await?
+            };
             let mut stream = resp.bytes_stream();
 
             while let Some(chunk) = stream.next().await {
@@ -389,8 +436,9 @@ impl GraphClient {
                 Ok(())
             }
             Err(e) => {
-                // Clean up partial temp file on failure.
-                let _ = tokio::fs::remove_file(&tmp_path).await;
+                // The partial file is deliberately kept: it is what the next
+                // attempt resumes from. Cleanup removes ones that go stale.
+                debug!("Download of {item_id} failed; keeping the partial copy to resume");
                 Err(e)
             }
         }
@@ -886,6 +934,64 @@ mod http_tests {
         assert!(
             !matches!(err, GraphError::ResyncRequired),
             "an unrelated 410 must not trigger a full resync"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_download_resumes_from_the_partial_copy() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("big.bin");
+
+        // A previous attempt left the first four bytes behind.
+        let tmp = dest.with_extension("bin.tmp");
+        std::fs::write(&tmp, b"AAAA").unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/me/drive/items/item1/content"))
+            .and(wiremock::matchers::header("Range", "bytes=4-"))
+            .and(wiremock::matchers::header("If-Range", "etag-1"))
+            .respond_with(ResponseTemplate::new(206).set_body_bytes(b"BBBB".to_vec()))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), dir.path());
+        client
+            .download_file_resumable("item1", &dest, Some("etag-1"))
+            .await
+            .unwrap();
+
+        // Appended, not overwritten: losing the first half would be silent
+        // corruption of a file that then looks complete.
+        assert_eq!(std::fs::read(&dest).unwrap(), b"AAAABBBB");
+    }
+
+    #[tokio::test]
+    async fn a_changed_file_replaces_the_partial_copy() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("doc.txt");
+        let tmp = dest.with_extension("txt.tmp");
+        std::fs::write(&tmp, b"OLDPARTIAL").unwrap();
+
+        // 200 rather than 206: the server ignored the range because the file
+        // is no longer the version our ETag names.
+        Mock::given(method("GET"))
+            .and(path("/me/drive/items/item1/content"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fresh".to_vec()))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri(), dir.path());
+        client
+            .download_file_resumable("item1", &dest, Some("stale-etag"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"fresh",
+            "appending to a partial copy of a different version would corrupt it"
         );
     }
 

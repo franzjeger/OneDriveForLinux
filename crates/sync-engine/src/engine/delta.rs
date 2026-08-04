@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// How long a partial download is kept before it is assumed abandoned. Long
+/// enough to survive a laptop being closed overnight.
+const PARTIAL_DOWNLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
 impl SyncEngine {
     /// One delta fetch, reporting page progress on the event channel.
     async fn fetch_delta(
@@ -312,7 +316,11 @@ impl SyncEngine {
                 if let Some(cache_dir) = &self.cache_dir {
                     let cache_path = cache_dir.join(&item.id);
                     if !cache_path.exists() {
-                        if let Err(e) = self.graph.download_file(&item.id, &cache_path).await {
+                        if let Err(e) = self
+                            .graph
+                            .download_file_resumable(&item.id, &cache_path, item.e_tag.as_deref())
+                            .await
+                        {
                             warn!("Pinned item {} download failed: {e}", item.id);
                         }
                     }
@@ -377,7 +385,11 @@ impl SyncEngine {
             warn!("Failed to send ItemStateChanged event: {e}");
         }
 
-        if let Err(e) = self.graph.download_file(&item.id, local_path).await {
+        if let Err(e) = self
+            .graph
+            .download_file_resumable(&item.id, local_path, item.e_tag.as_deref())
+            .await
+        {
             // Reset the Syncing state so the item isn't stuck as "Syncing" forever.
             if let Err(e2) = self
                 .db
@@ -553,8 +565,21 @@ impl SyncEngine {
                 None => continue,
             };
 
-            // Remove leftover .tmp files from interrupted atomic downloads.
+            // Leftover .tmp files are partial downloads, kept so an interrupted
+            // transfer can resume. Only remove ones old enough that no attempt
+            // is coming back for them.
             if name.ends_with(".tmp") {
+                let stale = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|t| {
+                        t.elapsed()
+                            .map(|age| age > PARTIAL_DOWNLOAD_TTL)
+                            .unwrap_or(true)
+                    })
+                    .unwrap_or(true);
+                if !stale {
+                    continue;
+                }
                 let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 if let Err(e) = std::fs::remove_file(&path) {
                     warn!("Cache cleanup: failed to remove tmp file {name}: {e}");

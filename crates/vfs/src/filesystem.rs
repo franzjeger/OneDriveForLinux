@@ -758,11 +758,15 @@ impl Filesystem for OneDriveFS {
             let db = Arc::clone(&self.db);
             let id = item_id.clone();
             let path = cache_path.clone();
+            let etag = item.etag.clone();
 
-            // 30-second timeout so a hung download never freezes Dolphin.
+            // 30-second timeout so a hung download never freezes Dolphin. A
+            // large file will not finish inside it — but the partial copy is
+            // kept now, so each attempt continues where the last stopped
+            // instead of a file too big to fetch in 30s never arriving at all.
             match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                graph.download_file(&id, &path),
+                graph.download_file_resumable(&id, &path, etag.as_deref()),
             )
             .await
             {
