@@ -272,6 +272,16 @@ private:
         return {};
     }
 
+    // The sync directory when config.toml does not name one. `sync_dir` is
+    // optional on the Rust side and most configs omit it, so treating "absent"
+    // as "no sync directory" would disable the plugin for almost everybody:
+    // getOverlays() rejects every path when m_syncDir is empty. Keep this in
+    // step with default_sync_dir() in crates/sync-engine/src/config.rs.
+    static QString defaultSyncDir()
+    {
+        return QDir::homePath() + QStringLiteral("/OneDrive/");
+    }
+
     // Parse sync_dir from ~/.config/onedrive-linux/config.toml.
     static QString readSyncDir()
     {
@@ -281,7 +291,7 @@ private:
 
         QFile file(configPath);
         if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
-            return {};
+            return defaultSyncDir();
 
         QTextStream in(&file);
         while (!in.atEnd()) {
@@ -299,11 +309,14 @@ private:
             }
             if (value.startsWith(QLatin1Char('~')))
                 value = QDir::homePath() + value.mid(1);
+            if (value.isEmpty())
+                return defaultSyncDir();
             if (!value.endsWith(QLatin1Char('/')))
                 value += QLatin1Char('/');
             return value;
         }
-        return {};
+        // No sync_dir key: the daemon is using its default, so match it.
+        return defaultSyncDir();
     }
 
     // Returns true if the daemon process recorded in the PID file is alive.

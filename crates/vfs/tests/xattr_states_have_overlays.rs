@@ -64,3 +64,31 @@ fn custom_emblems_referenced_by_the_plugin_are_shipped() {
         }
     }
 }
+
+/// `sync_dir` is optional in config.toml and most configs omit it. The plugin
+/// filters every path against its idea of the sync directory, so if it treated
+/// "absent" as "no sync directory" it would draw nothing at all for the common
+/// case — a failure indistinguishable from the plugin not being loaded.
+#[test]
+fn plugin_falls_back_to_the_same_default_sync_dir_as_the_daemon() {
+    let source = plugin_source();
+    assert!(
+        source.contains("defaultSyncDir"),
+        "the plugin must fall back to a default sync directory when config.toml \
+         omits sync_dir"
+    );
+    assert!(
+        source.contains("QStringLiteral(\"/OneDrive/\")"),
+        "the plugin's default sync directory must match default_sync_dir() in \
+         crates/sync-engine/src/config.rs"
+    );
+
+    let config_rs = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../sync-engine/src/config.rs"),
+    )
+    .expect("read config.rs");
+    assert!(
+        config_rs.contains("join(\"OneDrive\")"),
+        "the daemon's default sync directory changed; update the plugin to match"
+    );
+}
