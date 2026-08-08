@@ -73,9 +73,9 @@ pub struct OneDriveFS {
     db: Arc<Database>,
     graph: Arc<GraphClient>,
     /// inode → InodeEntry
-    inodes: RwLock<BTreeMap<u64, InodeEntry>>,
+    inodes: Arc<RwLock<BTreeMap<u64, InodeEntry>>>,
     /// item_id → inode
-    id_to_inode: RwLock<BTreeMap<String, u64>>,
+    id_to_inode: Arc<RwLock<BTreeMap<String, u64>>>,
     /// file handle → open cache file (pread/pwrite — no full-file RAM load)
     open_files: RwLock<BTreeMap<u64, std::fs::File>>,
     /// file handles that have had write() called — uploaded on release()
@@ -125,8 +125,8 @@ impl OneDriveFS {
         Ok(Self {
             db,
             graph,
-            inodes: RwLock::new(BTreeMap::new()),
-            id_to_inode: RwLock::new(BTreeMap::new()),
+            inodes: Arc::new(RwLock::new(BTreeMap::new())),
+            id_to_inode: Arc::new(RwLock::new(BTreeMap::new())),
             open_files: RwLock::new(BTreeMap::new()),
             dirty_fhs: RwLock::new(HashSet::new()),
             excluded_patterns,
@@ -249,10 +249,29 @@ impl OneDriveFS {
             })
             .unwrap_or_else(epoch_ts);
 
+        // The cached copy, when there is one, is the local truth — and the
+        // database is not. The row's `size` only changes when a delta pass or a
+        // completed upload writes it back, so between `write()` and the upload
+        // landing (seconds to minutes) the database still says what the file
+        // used to be. Reporting that meant a file the user had just written
+        // stat'd as 0 bytes and read back empty, while `fsync()` returned
+        // success — durability promised and not delivered.
+        //
+        // A cache file is only ever whole: downloads land via rename from a
+        // `.tmp`, so its length is either the remote content or a local edit
+        // that is ahead of it. Either way it beats the row.
+        let (size, mtime) = match std::fs::metadata(self.cache_dir.join(&item.id)) {
+            Ok(meta) if !item.is_folder => (
+                meta.len(),
+                meta.modified().map(sys_time_to_ts).unwrap_or(mtime),
+            ),
+            _ => (item.size, mtime),
+        };
+
         FileAttr {
             ino,
-            size: item.size,
-            blocks: item.size.div_ceil(512),
+            size,
+            blocks: size.div_ceil(512),
             atime: mtime,
             mtime,
             ctime,
@@ -789,14 +808,34 @@ impl Filesystem for OneDriveFS {
         // Open the cache file — read+write so the same handle works for both
         // read() and write() FUSE calls without storing file content in RAM.
         let write_access = flags & libc::O_WRONLY as u32 != 0 || flags & libc::O_RDWR as u32 != 0;
-        let file = std::fs::OpenOptions::new()
+        let file = match std::fs::OpenOptions::new()
             .read(true)
             .write(write_access)
             .open(&cache_path)
-            .map_err(|e| {
+        {
+            Ok(file) => file,
+            // A `_local_*` item exists only in the cache — it was created here
+            // and its content has never been anywhere else. If the cache file is
+            // gone, so is the file, and there is nothing to fetch.
+            //
+            // Reporting EIO for that made it a ghost: listed by the directory,
+            // plausible size, every read failing, and no way to remove it.
+            // ENOENT is the truth, and dropping the row stops it being listed.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                warn!(
+                    "{item_id} has no cached content and nothing on OneDrive to \
+                     fetch — dropping the entry"
+                );
+                if let Err(e) = self.db.delete_item(&item_id).await {
+                    warn!("Failed to drop the dead entry {item_id}: {e}");
+                }
+                return Err(libc::ENOENT.into());
+            }
+            Err(e) => {
                 error!("open cache {:?}: {e}", cache_path);
-                libc::EIO
-            })?;
+                return Err(libc::EIO.into());
+            }
+        };
 
         let fh = self.next_fh();
         self.open_files.write().await.insert(fh, file);
@@ -888,6 +927,11 @@ impl Filesystem for OneDriveFS {
                     let cache_path = self.cache_dir.join(&id);
                     let graph = Arc::clone(&self.graph);
                     let db = Arc::clone(&self.db);
+                    // Needed to adopt the real OneDrive ID once the upload of a
+                    // locally created file returns one — see below.
+                    let cache_dir = self.cache_dir.clone();
+                    let inodes = Arc::clone(&self.inodes);
+                    let id_to_inode = Arc::clone(&self.id_to_inode);
 
                     // Upload in background — release() must return immediately so
                     // the kernel doesn't block the calling process (e.g. Dolphin).
@@ -928,6 +972,47 @@ impl Filesystem for OneDriveFS {
                                     updated_item.modified_at = updated.last_modified_date_time;
                                     updated_item.is_placeholder = false;
                                     updated_item.sync_state = SyncState::Synced;
+
+                                    // Adopt the real OneDrive ID.
+                                    //
+                                    // A file created through the mount gets a
+                                    // temporary `_local_*` ID so it is usable
+                                    // before the upload finishes. The upload
+                                    // returns the ID OneDrive actually gave it,
+                                    // and keeping the temporary one instead left
+                                    // a row that owns the path under an ID Graph
+                                    // has never heard of. Every later delta then
+                                    // collided with it on `local_path` — which
+                                    // used to roll back the entire delta batch,
+                                    // so one created file could stop sync dead.
+                                    let old_id =
+                                        std::mem::replace(&mut updated_item.id, updated.id.clone());
+                                    if old_id != updated_item.id {
+                                        // The cache file is named after the ID, so
+                                        // it has to move with it or the next open()
+                                        // finds nothing and the file reads as EIO.
+                                        let new_cache = cache_dir.join(&updated_item.id);
+                                        if let Err(e) = std::fs::rename(&cache_path, &new_cache) {
+                                            error!(
+                                                "adopting {} -> {}: could not move the cached \
+                                                 copy: {e}",
+                                                old_id, updated_item.id
+                                            );
+                                        }
+                                        // Repoint the inode the kernel already
+                                        // handed out; it must keep resolving.
+                                        let mut ids = id_to_inode.write().await;
+                                        if let Some(ino) = ids.remove(&old_id) {
+                                            ids.insert(updated_item.id.clone(), ino);
+                                            if let Some(entry) = inodes.write().await.get_mut(&ino)
+                                            {
+                                                entry.item_id = updated_item.id.clone();
+                                            }
+                                        }
+                                    }
+
+                                    // `upsert_item` evicts whatever else owns this
+                                    // path, which is how the old `_local_*` row goes.
                                     if let Err(e) = db.upsert_item(&updated_item).await {
                                         error!("Failed to upsert item after upload: {e}");
                                     }
