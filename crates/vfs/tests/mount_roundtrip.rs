@@ -622,3 +622,172 @@ async fn deleting_a_file_while_its_upload_is_in_flight_makes_the_delete_win() {
     );
     assert!(!path_exists, "the deleted file reappeared in the mount");
 }
+
+/// The atomic save: write a temp file, then rename it over the target.
+///
+/// This is how vim, VS Code and most build tools save — it is the normal case,
+/// not an edge case. It lost the target file: `README.md` disappeared and
+/// `README.md.tmp.194149.5089d5eff10a` was left holding the content.
+///
+/// `rename()` was not the culprit; it applies the rename locally. The upload of
+/// the temp file was still in flight, having started under the temp name, so
+/// OneDrive ended up holding the file under *that* name. The next delta then
+/// dragged the temp name back down over the local one — the target vanished and
+/// the temp file appeared, which reads exactly like data loss.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_atomic_save_leaves_the_file_under_its_real_name() {
+    if !fuse_available() {
+        skip("no /dev/fuse or fusermount3 available");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mountpoint = tmp.path().join("mount");
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let server = mock_graph().await;
+    // The temp file's upload, held open so the rename lands mid-flight —
+    // which is what happens in practice, and made the bug deterministic.
+    Mock::given(method("PUT"))
+        .and(path_regex(
+            r"^/me/drive/items/root:/notes\.md\.tmp\.[0-9a-f]+:/content$",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(2))
+                .set_body_json(serde_json::json!({
+                    "id": "saved-item",
+                    "name": "notes.md.tmp.194149",
+                    "eTag": "etag-tmp",
+                    "size": NEW_CONTENT.len(),
+                    "lastModifiedDateTime": "2026-01-05T00:00:00Z",
+                    "file": { "mimeType": "text/markdown" },
+                    "parentReference": { "id": "root" }
+                })),
+        )
+        .mount(&server)
+        .await;
+    // Correcting the remote name is a PATCH on the item.
+    Mock::given(method("PATCH"))
+        .and(path("/me/drive/items/saved-item"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "saved-item",
+            "name": "notes.md",
+            "eTag": "etag-final",
+            "size": NEW_CONTENT.len(),
+            "lastModifiedDateTime": "2026-01-05T00:00:01Z",
+            "file": { "mimeType": "text/markdown" },
+            "parentReference": { "id": "root" }
+        })))
+        .mount(&server)
+        .await;
+
+    let graph = test_graph(&server.uri(), tmp.path());
+    let db = Arc::new(Database::open(&tmp.path().join("items.db")).unwrap());
+    let config = Arc::new(test_config(&mountpoint));
+
+    let token = TokenSet {
+        access_token: "test-token".into(),
+        refresh_token: Some("refresh".into()),
+        expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        token_type: "Bearer".into(),
+        scope: "Files.ReadWrite.All".into(),
+    };
+    let auth = Arc::new(AuthManager::for_tests(token, tmp.path().join("t2.json")));
+    let (engine, _events) = SyncEngine::new(
+        Arc::clone(&config),
+        Arc::clone(&db),
+        Arc::clone(&graph),
+        auth,
+        Some(cache_dir.clone()),
+    );
+    engine.sync_once().await.expect("delta pass");
+
+    let fs = vfs::OneDriveFS::new(
+        Arc::clone(&db),
+        Arc::clone(&graph),
+        mountpoint.clone(),
+        cache_dir.clone(),
+        config.excluded_patterns.clone(),
+    )
+    .await
+    .expect("build filesystem");
+
+    let mount_handle = match fuse3::raw::Session::new(fuse3::MountOptions::default())
+        .mount_with_unprivileged(fs, &mountpoint)
+        .await
+    {
+        Ok(handle) => handle,
+        Err(e) => {
+            skip(&format!("could not mount FUSE: {e}"));
+            return;
+        }
+    };
+
+    let mp = mountpoint.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let target = mp.join("notes.md");
+        let temp = mp.join("notes.md.tmp.194149");
+
+        let mut fh = std::fs::File::create(&temp).expect("create the temp file");
+        fh.write_all(NEW_CONTENT).expect("write");
+        drop(fh);
+        std::fs::rename(&temp, &target).expect("rename the temp file over the target");
+
+        assert!(
+            target.exists(),
+            "the saved file is missing straight after the rename"
+        );
+        assert!(
+            !temp.exists(),
+            "the temp file is still there — the rename did not replace it"
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read the saved file"),
+            NEW_CONTENT,
+            "the saved file must hold what was written"
+        );
+    })
+    .await;
+
+    // Let the in-flight upload finish and correct itself.
+    let outcome = if result.is_ok() {
+        let renamed_remotely = await_request(&server, "PATCH", Duration::from_secs(15)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let row = db.get_item_by_id("saved-item").await.unwrap();
+        Some((
+            renamed_remotely,
+            row,
+            mountpoint.join("notes.md").exists(),
+            mountpoint.join("notes.md.tmp.194149").exists(),
+        ))
+    } else {
+        None
+    };
+    let _ = mount_handle.unmount().await;
+    result.expect("filesystem operations through the mount");
+
+    let (renamed_remotely, row, target_there, temp_there) = outcome.unwrap();
+    assert!(
+        renamed_remotely,
+        "the upload started under the temp name and was never corrected, so \
+         OneDrive holds the file as `notes.md.tmp.194149` — the next delta renames \
+         the local file back to that and the saved file disappears"
+    );
+    let row = row.expect("the saved file must still have a row");
+    assert_eq!(
+        row.name, "notes.md",
+        "the row must carry the name the file was saved under"
+    );
+    assert!(
+        target_there,
+        "the saved file vanished after the upload settled"
+    );
+    assert!(
+        !temp_there,
+        "the temp name came back — this is what made an edit look like data loss"
+    );
+}
