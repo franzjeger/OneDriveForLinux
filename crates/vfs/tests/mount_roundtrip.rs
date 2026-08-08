@@ -955,3 +955,123 @@ async fn a_file_deleted_inside_the_quiet_period_never_uploads() {
         "the deleted file is still queued, so it will upload later and come back"
     );
 }
+
+/// `chmod +x` has to stick, and the file has to run.
+///
+/// The mount reported a hardcoded 644 for every file and accepted `chmod`
+/// without doing anything, so marking a script executable silently did nothing:
+/// `chmod` reported success, `ls -l` kept saying 644, and running it failed with
+/// exit 126. Cargo writes a build script, marks it executable and runs it — so
+/// no Rust build could work inside the mount, and nothing in the error said why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_script_made_executable_stays_executable_and_runs() {
+    if !fuse_available() {
+        skip("no /dev/fuse or fusermount3 available");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mountpoint = tmp.path().join("mount");
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let server = mock_graph().await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/me/drive/items/root:/build\.sh:/content$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "script-item",
+            "name": "build.sh",
+            "eTag": "etag-script",
+            "size": 24,
+            "lastModifiedDateTime": "2026-01-06T00:00:00Z",
+            "file": { "mimeType": "text/x-shellscript" },
+            "parentReference": { "id": "root" }
+        })))
+        .mount(&server)
+        .await;
+
+    let graph = test_graph(&server.uri(), tmp.path());
+    let db = Arc::new(Database::open(&tmp.path().join("items.db")).unwrap());
+    let config = Arc::new(test_config(&mountpoint));
+
+    let token = TokenSet {
+        access_token: "test-token".into(),
+        refresh_token: Some("refresh".into()),
+        expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        token_type: "Bearer".into(),
+        scope: "Files.ReadWrite.All".into(),
+    };
+    let auth = Arc::new(AuthManager::for_tests(token, tmp.path().join("t2.json")));
+    let (engine, _events) = SyncEngine::new(
+        Arc::clone(&config),
+        Arc::clone(&db),
+        Arc::clone(&graph),
+        auth,
+        Some(cache_dir.clone()),
+    );
+    engine.sync_once().await.expect("delta pass");
+
+    let fs = vfs::OneDriveFS::new(
+        Arc::clone(&db),
+        Arc::clone(&graph),
+        mountpoint.clone(),
+        cache_dir.clone(),
+        config.excluded_patterns.clone(),
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("build filesystem");
+
+    let mount_handle = match fuse3::raw::Session::new(fuse3::MountOptions::default())
+        .mount_with_unprivileged(fs, &mountpoint)
+        .await
+    {
+        Ok(handle) => handle,
+        Err(e) => {
+            skip(&format!("could not mount FUSE: {e}"));
+            return;
+        }
+    };
+
+    let mp = mountpoint.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let script = mp.join("build.sh");
+
+        let mut fh = std::fs::File::create(&script).expect("create the script");
+        fh.write_all(b"#!/bin/sh\necho built\n").expect("write");
+        drop(fh);
+
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod +x");
+
+        let mode = std::fs::metadata(&script)
+            .expect("stat the script")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o111,
+            0o111,
+            "chmod +x reported success but the mode is still {:o} — this is the \
+             silent no-op that made cargo builds fail inside the mount",
+            mode & 0o777
+        );
+
+        let out = std::process::Command::new(&script)
+            .output()
+            .expect("run the script");
+        assert!(
+            out.status.success(),
+            "the script would not run: exit {:?} — 126 is the shell's \
+             \"found it, cannot execute it\"",
+            out.status.code()
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "built");
+    })
+    .await;
+
+    let _ = mount_handle.unmount().await;
+    result.expect("filesystem operations through the mount");
+}

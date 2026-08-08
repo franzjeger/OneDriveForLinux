@@ -146,6 +146,16 @@ impl Database {
             [],
         );
 
+        // The executable bit, which OneDrive does not carry.
+        //
+        // Kept out of `items` deliberately: it is local-only, it survives the
+        // row being replaced when an upload adopts the real OneDrive ID, and it
+        // must not be touched by delta sync. Presence means executable.
+        let _ = conn.execute(
+            "CREATE TABLE IF NOT EXISTS exec_bits (item_id TEXT PRIMARY KEY)",
+            [],
+        );
+
         // Partial index on pinned — created after ALTER TABLE so the column is guaranteed to exist.
         let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_items_pinned ON items(pinned) WHERE pinned = 1",
@@ -277,6 +287,54 @@ impl Database {
             } else {
                 Ok(None)
             }
+        })
+        .await
+    }
+
+    /// Remember whether a file is executable.
+    ///
+    /// OneDrive has no concept of a POSIX mode, so this is ours to keep. Losing
+    /// it is not cosmetic: a build system that writes a script, marks it
+    /// executable and runs it fails outright, and `chmod` reporting success
+    /// while changing nothing gives no clue why.
+    pub async fn set_executable(&self, item_id: &str, executable: bool) -> Result<()> {
+        let item_id = item_id.to_string();
+        self.with_conn(move |conn| {
+            if executable {
+                conn.execute(
+                    "INSERT OR IGNORE INTO exec_bits (item_id) VALUES (?1)",
+                    params![item_id],
+                )?;
+            } else {
+                conn.execute("DELETE FROM exec_bits WHERE item_id = ?1", params![item_id])?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Whether a file was marked executable.
+    pub async fn is_executable(&self, item_id: &str) -> Result<bool> {
+        let item_id = item_id.to_string();
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare_cached("SELECT 1 FROM exec_bits WHERE item_id = ?1")?;
+            let mut rows = stmt.query(params![item_id])?;
+            let found = rows.next()?.is_some();
+            Ok(found)
+        })
+        .await
+    }
+
+    /// Carry the bit across an ID change — an upload adopting the real OneDrive
+    /// ID replaces the row, and the mode must not be lost with it.
+    pub async fn move_executable(&self, old_id: &str, new_id: &str) -> Result<()> {
+        let (old_id, new_id) = (old_id.to_string(), new_id.to_string());
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE OR REPLACE exec_bits SET item_id = ?2 WHERE item_id = ?1",
+                params![old_id, new_id],
+            )?;
+            Ok(())
         })
         .await
     }
