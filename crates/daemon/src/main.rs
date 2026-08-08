@@ -13,6 +13,12 @@ use sync_engine::{Config, Database, SyncEngine};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+/// The release this binary was built from — see the same constant in odctl.
+const VERSION: &str = match option_env!("ONEDRIVE_RELEASE_VERSION") {
+    Some(v) => v,
+    None => concat!(env!("CARGO_PKG_VERSION"), " (development build)"),
+};
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // ── Tracing ────────────────────────────────────────────────────────────────
@@ -21,7 +27,7 @@ async fn main() -> Result<()> {
         .with_target(true)
         .init();
 
-    info!("OneDrive for Linux daemon starting");
+    info!("OneDrive for Linux daemon starting — {VERSION}");
 
     // ── Single-instance lock ───────────────────────────────────────────────────
     let pid_path = dirs::runtime_dir()

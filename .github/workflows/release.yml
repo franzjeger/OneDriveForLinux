@@ -30,9 +30,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build
-        run: cargo build --release --workspace
-
       # A dispatch input is free text and the tag is used verbatim, so a
       # version typed without the leading "v" produces a tag the push trigger
       # ("v*") would never match and install.sh does not recognise. Normalise
@@ -47,6 +44,15 @@ jobs:
           esac
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Releasing $VERSION"
+
+      - name: Build
+        # Stamps the release into the binaries: every crate is version 0.1.0, so
+        # without this `odctl --version` and the daemon's startup log both
+        # report "0.1.0" for every build ever shipped — no way to tell whether
+        # an upgrade took.
+        env:
+          ONEDRIVE_RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: cargo build --release --workspace
 
       - name: Package
         run: |

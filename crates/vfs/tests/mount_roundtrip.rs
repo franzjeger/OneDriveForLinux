@@ -161,6 +161,21 @@ async fn await_upload(server: &MockServer, within: Duration) -> wiremock::Reques
     }
 }
 
+/// Whether a request with the given method reached the server in time.
+async fn await_request(server: &MockServer, verb: &str, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        let requests = server.received_requests().await.unwrap_or_default();
+        if requests.iter().any(|r| r.method.as_str() == verb) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn edit_through_the_mount_reaches_onedrive() {
     if !fuse_available() {
@@ -467,4 +482,143 @@ async fn a_file_created_through_the_mount_is_readable_and_adopts_its_real_id() {
     }])
     .await
     .expect("a delta pass must be able to record a file created through the mount");
+}
+
+/// Deleting a file within seconds of writing it did not take: the file came
+/// back, with its content.
+///
+/// A locally created file uploads in the background after `release()`. `unlink()`
+/// deleted the row and the cached copy, but the upload was already in flight —
+/// and on completion it re-read the row, found it gone, fell back to its own
+/// stale copy and wrote it back. Meanwhile the upload had created the file on
+/// OneDrive, so the resurrected row pointed at real remote content.
+///
+/// `unlink()` could not have prevented it. For a `_local_*` item there is
+/// nothing on OneDrive to delete at the time it runs; the remote copy only comes
+/// into existence when the upload finishes. Removing it belongs to the upload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deleting_a_file_while_its_upload_is_in_flight_makes_the_delete_win() {
+    if !fuse_available() {
+        skip("no /dev/fuse or fusermount3 available");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mountpoint = tmp.path().join("mount");
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let server = mock_graph().await;
+    // Held open long enough that the unlink lands mid-upload every run, rather
+    // than depending on how fast the machine is.
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/me/drive/items/root:/churn\.bin:/content$"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(2))
+                .set_body_json(serde_json::json!({
+                    "id": "uploaded-then-deleted",
+                    "name": "churn.bin",
+                    "eTag": "etag-churn",
+                    "size": NEW_CONTENT.len(),
+                    "lastModifiedDateTime": "2026-01-04T00:00:00Z",
+                    "file": { "mimeType": "application/octet-stream" },
+                    "parentReference": { "id": "root" }
+                })),
+        )
+        .mount(&server)
+        .await;
+    // The upload must clean up after itself.
+    Mock::given(method("DELETE"))
+        .and(path("/me/drive/items/uploaded-then-deleted"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let graph = test_graph(&server.uri(), tmp.path());
+    let db = Arc::new(Database::open(&tmp.path().join("items.db")).unwrap());
+    let config = Arc::new(test_config(&mountpoint));
+
+    let token = TokenSet {
+        access_token: "test-token".into(),
+        refresh_token: Some("refresh".into()),
+        expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        token_type: "Bearer".into(),
+        scope: "Files.ReadWrite.All".into(),
+    };
+    let auth = Arc::new(AuthManager::for_tests(token, tmp.path().join("t2.json")));
+    let (engine, _events) = SyncEngine::new(
+        Arc::clone(&config),
+        Arc::clone(&db),
+        Arc::clone(&graph),
+        auth,
+        Some(cache_dir.clone()),
+    );
+    engine.sync_once().await.expect("delta pass");
+
+    let fs = vfs::OneDriveFS::new(
+        Arc::clone(&db),
+        Arc::clone(&graph),
+        mountpoint.clone(),
+        cache_dir.clone(),
+        config.excluded_patterns.clone(),
+    )
+    .await
+    .expect("build filesystem");
+
+    let mount_handle = match fuse3::raw::Session::new(fuse3::MountOptions::default())
+        .mount_with_unprivileged(fs, &mountpoint)
+        .await
+    {
+        Ok(handle) => handle,
+        Err(e) => {
+            skip(&format!("could not mount FUSE: {e}"));
+            return;
+        }
+    };
+
+    let mp = mountpoint.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let file = mp.join("churn.bin");
+        let mut fh = std::fs::File::create(&file).expect("create");
+        fh.write_all(NEW_CONTENT).expect("write");
+        drop(fh);
+        // Immediately, inside the upload window — the case that failed.
+        std::fs::remove_file(&file).expect("delete right after writing");
+        assert!(
+            !file.exists(),
+            "the file must be gone the moment unlink() returns"
+        );
+    })
+    .await;
+
+    // Outlast the upload, so the completion path has run.
+    let outcome = if result.is_ok() {
+        let deleted = await_request(&server, "DELETE", Duration::from_secs(15)).await;
+        // And it must still be gone once everything has settled.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let row = db.get_item_by_id("uploaded-then-deleted").await.unwrap();
+        let still_there = mountpoint.join("churn.bin");
+        Some((deleted, row, still_there.exists()))
+    } else {
+        None
+    };
+    let _ = mount_handle.unmount().await;
+    result.expect("filesystem operations through the mount");
+
+    let (deleted, row, path_exists) = outcome.unwrap();
+    assert!(
+        deleted,
+        "the upload created the file on OneDrive after the local delete and never \
+         removed it — the file comes back on the next delta, and a rewrite of the \
+         same name gets 409 nameAlreadyExists"
+    );
+    assert!(
+        row.is_none(),
+        "the completed upload wrote the deleted file's row back — this is the \
+         resurrection: delete a file within seconds of writing it and it returns"
+    );
+    assert!(!path_exists, "the deleted file reappeared in the mount");
 }
