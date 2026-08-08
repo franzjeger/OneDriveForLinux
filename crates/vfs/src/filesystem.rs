@@ -104,6 +104,10 @@ pub struct OneDriveFS {
     symlink_inodes: RwLock<BTreeMap<u64, SymlinkEntry>>,
     /// (parent_inode, name) → symlink inode for fast lookup
     symlink_lookup: RwLock<BTreeMap<(u64, String), u64>>,
+    /// Edits waiting out their quiet period before upload.
+    pending: Arc<crate::pending::PendingUploads>,
+    /// How long a file must go untouched before its edit is uploaded.
+    upload_debounce: std::time::Duration,
 }
 
 impl OneDriveFS {
@@ -113,6 +117,7 @@ impl OneDriveFS {
         sync_dir: std::path::PathBuf,
         cache_dir: std::path::PathBuf,
         excluded_patterns: Vec<String>,
+        upload_debounce: std::time::Duration,
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&cache_dir)
             .map_err(|e| anyhow::anyhow!("create cache dir {:?}: {e}", cache_dir))?;
@@ -137,7 +142,17 @@ impl OneDriveFS {
             root_drive_id: RwLock::new(root_drive_id),
             symlink_inodes: RwLock::new(BTreeMap::new()),
             symlink_lookup: RwLock::new(BTreeMap::new()),
+            pending: Arc::new(crate::pending::PendingUploads::new()),
+            upload_debounce,
         })
+    }
+
+    /// The queue of edits waiting to upload.
+    ///
+    /// Taken before the filesystem is handed to the FUSE session, which
+    /// consumes it — the daemon needs this to flush on shutdown.
+    pub fn pending_uploads(&self) -> Arc<crate::pending::PendingUploads> {
+        Arc::clone(&self.pending)
     }
 
     fn next_fh(&self) -> u64 {
@@ -345,19 +360,29 @@ impl OneDriveFS {
     }
 
     /// Resolve current attributes for any inode: root, regular item, or symlink.
+    /// The row behind an inode.
+    ///
+    /// The inode lock is held across the query on purpose. An upload that
+    /// adopts the real OneDrive ID has to move the row from the temporary
+    /// `_local_*` ID to the real one, and `local_path` is unique, so the two
+    /// rows can never both exist — read the ID, then query, and a swap that
+    /// lands between the two makes a file the user just wrote look deleted.
+    ///
+    /// Adoption takes the same lock for writing across its own update, so a
+    /// reader sees either the whole "before" or the whole "after".
+    async fn resolve_item(&self, inode: u64) -> Option<DbItem> {
+        let map = self.inodes.read().await;
+        let item_id = map.get(&inode).map(|e| e.item_id.clone())?;
+        self.db.get_item_by_id(&item_id).await.ok().flatten()
+    }
+
     async fn attr_for_inode(&self, inode: u64) -> Option<FileAttr> {
         if inode == 1 {
             return Some(self.root_attr());
         }
 
-        let item_id = {
-            let map = self.inodes.read().await;
-            map.get(&inode).map(|e| e.item_id.clone())
-        };
-        if let Some(id) = item_id {
-            if let Ok(Some(item)) = self.db.get_item_by_id(&id).await {
-                return Some(self.db_item_to_attr(&item, inode));
-            }
+        if let Some(item) = self.resolve_item(inode).await {
+            return Some(self.db_item_to_attr(&item, inode));
         }
 
         let map = self.symlink_inodes.read().await;
@@ -753,18 +778,8 @@ impl Filesystem for OneDriveFS {
     async fn open(&self, _req: Request, inode: u64, flags: u32) -> FuseResult<ReplyOpen> {
         debug!("open inode={inode} flags={flags:#o}");
 
-        let item_id = {
-            let map = self.inodes.read().await;
-            map.get(&inode).map(|e| e.item_id.clone())
-        };
-        let item_id = item_id.ok_or(libc::ENOENT)?;
-
-        let item = self
-            .db
-            .get_item_by_id(&item_id)
-            .await
-            .map_err(|_| libc::EIO)?
-            .ok_or(libc::ENOENT)?;
+        let item = self.resolve_item(inode).await.ok_or(libc::ENOENT)?;
+        let item_id = item.id.clone();
 
         // Cache file lives OUTSIDE the FUSE mountpoint to avoid recursive FUSE calls.
         let cache_path = self.cache_dir.join(&item_id);
@@ -932,10 +947,58 @@ impl Filesystem for OneDriveFS {
                     let cache_dir = self.cache_dir.clone();
                     let inodes = Arc::clone(&self.inodes);
                     let id_to_inode = Arc::clone(&self.id_to_inode);
+                    let pending = Arc::clone(&self.pending);
+
+                    // Wait for the file to go quiet first. An atomic save closes
+                    // a temp file it is about to rename away; a scratch file may
+                    // be deleted seconds later; an editor may save ten times in
+                    // a minute. Uploading on close made all three race their own
+                    // upload. Waiting means the upload sees the settled result.
+                    let waiter_id = id.clone();
+                    let scheduled = pending.schedule(&waiter_id, self.upload_debounce).await;
+                    // release() is asynchronous with respect to close(), so an
+                    // unlink of this file can land between the row check above
+                    // and the schedule above. It would cancel an entry that did
+                    // not exist yet, and this one would then sit out the whole
+                    // window for a file that is gone — never uploading, since it
+                    // re-reads the row first, but counting as unsent the whole
+                    // time. Re-check now that the entry is in.
+                    if self
+                        .db
+                        .get_item_by_id(&waiter_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_none()
+                    {
+                        pending.cancel(&waiter_id).await;
+                        return Ok(());
+                    }
+                    if !scheduled {
+                        // Already waiting — that call just pushed its deadline
+                        // out, and the existing waiter will upload the newer
+                        // content from the same cache file.
+                        return Ok(());
+                    }
 
                     // Upload in background — release() must return immediately so
                     // the kernel doesn't block the calling process (e.g. Dolphin).
                     tokio::spawn(async move {
+                        if !pending.wait_until_due(&waiter_id).await {
+                            debug!("upload of {waiter_id} cancelled while waiting");
+                            return;
+                        }
+                        let _in_flight = pending.begin_upload(&waiter_id).await;
+
+                        // Re-read: the file has had the whole quiet period to be
+                        // renamed, and the name is what the upload is addressed by.
+                        let item = match db.get_item_by_id(&waiter_id).await {
+                            Ok(Some(current)) => current,
+                            _ => {
+                                debug!("{waiter_id} no longer exists — nothing to upload");
+                                return;
+                            }
+                        };
                         if let Some(parent_id) = item.parent_id.clone() {
                             // If-Match on the ETag we last synced. Without it an
                             // upload is last-writer-wins: a file changed on
@@ -1064,10 +1127,59 @@ impl Filesystem for OneDriveFS {
                                     // so one created file could stop sync dead.
                                     let old_id =
                                         std::mem::replace(&mut updated_item.id, updated.id.clone());
-                                    if old_id != updated_item.id {
+                                    let adopted = old_id != updated_item.id;
+                                    if adopted {
+                                        // The row moves to the new ID *before* the
+                                        // cache file does.
+                                        //
+                                        // Renaming first left a window where the
+                                        // row still said `_local_*` and its cache
+                                        // file was already gone — which a read
+                                        // landing there treats as a file with no
+                                        // content anywhere, and drops the row for.
+                                        // A file could vanish moments after being
+                                        // written, purely because it happened to be
+                                        // uploading at the time.
+                                        //
+                                        // Moving the row first makes the window
+                                        // harmless: the ID is real, so a read
+                                        // inside it fetches from OneDrive, which
+                                        // now holds the content.
+                                        // Both halves of the swap under the
+                                        // inode lock, which resolve_item holds
+                                        // across its query — so no read can land
+                                        // between the row moving and the inode
+                                        // following it.
+                                        {
+                                            let mut entries = inodes.write().await;
+                                            // Re-read once more, inside the lock.
+                                            // The earlier read was before a network
+                                            // call; a rename landing since then
+                                            // would otherwise be overwritten by the
+                                            // name this upload started with, and
+                                            // the saved file would look missing
+                                            // until the next delta.
+                                            if let Ok(Some(latest)) =
+                                                db.get_item_by_id(&old_id).await
+                                            {
+                                                updated_item.name = latest.name;
+                                                updated_item.local_path = latest.local_path;
+                                                updated_item.parent_id = latest.parent_id;
+                                            }
+                                            if let Err(e) = db.upsert_item(&updated_item).await {
+                                                error!("Failed to adopt the real ID: {e}");
+                                            }
+                                            let mut ids = id_to_inode.write().await;
+                                            if let Some(ino) = ids.remove(&old_id) {
+                                                ids.insert(updated_item.id.clone(), ino);
+                                                if let Some(entry) = entries.get_mut(&ino) {
+                                                    entry.item_id = updated_item.id.clone();
+                                                }
+                                            }
+                                        }
                                         // The cache file is named after the ID, so
                                         // it has to move with it or the next open()
-                                        // finds nothing and the file reads as EIO.
+                                        // re-fetches content we already have.
                                         let new_cache = cache_dir.join(&updated_item.id);
                                         if let Err(e) = std::fs::rename(&cache_path, &new_cache) {
                                             error!(
@@ -1076,22 +1188,13 @@ impl Filesystem for OneDriveFS {
                                                 old_id, updated_item.id
                                             );
                                         }
-                                        // Repoint the inode the kernel already
-                                        // handed out; it must keep resolving.
-                                        let mut ids = id_to_inode.write().await;
-                                        if let Some(ino) = ids.remove(&old_id) {
-                                            ids.insert(updated_item.id.clone(), ino);
-                                            if let Some(entry) = inodes.write().await.get_mut(&ino)
-                                            {
-                                                entry.item_id = updated_item.id.clone();
-                                            }
-                                        }
                                     }
 
-                                    // `upsert_item` evicts whatever else owns this
-                                    // path, which is how the old `_local_*` row goes.
-                                    if let Err(e) = db.upsert_item(&updated_item).await {
-                                        error!("Failed to upsert item after upload: {e}");
+                                    // Already written above when adopting a new ID.
+                                    if !adopted {
+                                        if let Err(e) = db.upsert_item(&updated_item).await {
+                                            error!("Failed to upsert item after upload: {e}");
+                                        }
                                     }
                                     info!(
                                         "upload complete: {} ({} bytes)",
@@ -1271,6 +1374,13 @@ impl Filesystem for OneDriveFS {
             if let Err(e) = self.db.delete_item(&item.id).await {
                 warn!("Failed to delete DB item {}: {e}", item.id);
             }
+            // Drop any edit still waiting to upload — otherwise the wait expires
+            // after the file is gone and puts it back.
+            //
+            // Deliberately after the row is deleted, so this and release()'s
+            // re-check cover each other: whichever of the two runs last finds
+            // the state the other left and cleans up.
+            self.pending.cancel(&item.id).await;
             // Remove the cache file if present. Do NOT touch item.local_path — it is
             // inside the FUSE mount and accessing it from the daemon causes a recursive
             // FUSE deadlock. The kernel removes the FUSE entry when we return Ok(()).

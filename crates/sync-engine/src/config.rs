@@ -52,6 +52,18 @@ fn default_max_cache_size_gb() -> f64 {
     10.0
 }
 
+/// How long a file must go untouched before its edit is uploaded.
+///
+/// Uploading the instant a file closes made the mount race itself: an atomic
+/// save uploads a temp file it is about to rename away, a scratch file races
+/// its own delete, and an editor saving repeatedly starts an upload per save.
+/// Waiting for quiet removes all of that — at the cost of the edit living only
+/// on this machine until the wait is up, which is why the daemon flushes the
+/// queue before it shuts down.
+fn default_upload_debounce_secs() -> u64 {
+    900
+}
+
 fn default_auth_method() -> String {
     "auto".into()
 }
@@ -101,6 +113,12 @@ pub struct Config {
     /// and never files whose upload has not completed. `0` disables the limit.
     #[serde(default = "default_max_cache_size_gb")]
     pub max_cache_size_gb: f64,
+
+    /// Seconds a file must go untouched before its edit is uploaded. `0`
+    /// uploads as soon as the file is closed, which is what the client used to
+    /// do — see [`default_upload_debounce_secs`] for why that was a problem.
+    #[serde(default = "default_upload_debounce_secs")]
+    pub upload_debounce_secs: u64,
 
     /// How to sign in: "auto" (browser when a desktop session is present),
     /// "browser" (authorization code + PKCE — required when Conditional
@@ -159,6 +177,7 @@ impl Config {
             max_download_threads: 4,
             delta_poll_interval_secs: 30,
             max_cache_size_gb: default_max_cache_size_gb(),
+            upload_debounce_secs: default_upload_debounce_secs(),
             auth_method: default_auth_method(),
         };
         cfg.save()

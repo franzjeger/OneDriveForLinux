@@ -18,6 +18,9 @@ pub struct OneDriveInterface {
     pub needs_auth: Arc<std::sync::atomic::AtomicBool>,
     pub progress: ProgressText,
     pub quota: crate::quota::QuotaCache,
+    /// Edits waiting out their quiet period in the FUSE layer. `None` when not
+    /// running on-demand, where there is no such queue.
+    pub pending_uploads: Option<Arc<vfs::PendingUploads>>,
 }
 
 #[interface(name = "com.onedrive.linux1")]
@@ -92,10 +95,19 @@ impl OneDriveInterface {
         Ok(self.progress.lock().clone())
     }
 
-    /// How many uploads are queued for retry. Non-zero means edits exist that
-    /// have not reached OneDrive yet.
+    /// How many edits have not reached OneDrive yet.
+    ///
+    /// Both kinds count: uploads queued for retry after a failure, and edits
+    /// still waiting out their quiet period. With a debounce of any length the
+    /// second kind is the common one, and leaving it out would show "everything
+    /// synced" over work that is still only on this machine.
     async fn pending_uploads(&self) -> zbus::fdo::Result<u32> {
-        Ok(self.engine.pending_uploads().await as u32)
+        let queued = self.engine.pending_uploads().await as u32;
+        let waiting = match &self.pending_uploads {
+            Some(pending) => pending.count().await as u32,
+            None => 0,
+        };
+        Ok(queued + waiting)
     }
 
     /// Bytes the on-demand cache is currently using.
@@ -200,6 +212,7 @@ pub async fn export_dbus(
     recent: RecentBuffer,
     needs_auth: Arc<std::sync::atomic::AtomicBool>,
     progress: ProgressText,
+    pending_uploads: Option<Arc<vfs::PendingUploads>>,
 ) -> anyhow::Result<Connection> {
     // The interface reaches Graph only through this cache.
     let quota = crate::quota::QuotaCache::new(graph);
@@ -213,6 +226,7 @@ pub async fn export_dbus(
                 needs_auth,
                 progress,
                 quota,
+                pending_uploads,
             },
         )
         .await?;

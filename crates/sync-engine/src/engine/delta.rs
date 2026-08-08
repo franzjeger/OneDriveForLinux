@@ -644,6 +644,7 @@ mod delta_tests {
             max_download_threads: 1,
             delta_poll_interval_secs: 30,
             max_cache_size_gb: 10.0,
+            upload_debounce_secs: 0,
             auth_method: "device_code".into(),
         });
         let dir = tempfile::tempdir().unwrap();

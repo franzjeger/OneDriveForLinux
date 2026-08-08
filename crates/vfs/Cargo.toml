@@ -18,6 +18,8 @@ bytes = "1"
 chrono.workspace = true
 
 [dev-dependencies]
+# start_paused: the debounce tests must not actually wait 15 minutes.
+tokio = { workspace = true, features = ["test-util"] }
 graph-client = { path = "../graph-client", features = ["test-util"] }
 wiremock = "0.6"
 tempfile = "3"
