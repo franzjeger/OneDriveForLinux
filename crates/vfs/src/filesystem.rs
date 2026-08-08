@@ -1004,6 +1004,44 @@ impl Filesystem for OneDriveFS {
                                             return;
                                         }
                                     };
+                                    // An atomic save writes a temp file, then
+                                    // renames it over the target — and the rename
+                                    // usually lands while this upload is still in
+                                    // flight. The upload used the name the file had
+                                    // when it started, so OneDrive now holds it under
+                                    // the temp name. The next delta then drags that
+                                    // name back down over the local one: the target
+                                    // vanishes and the temp name reappears, holding
+                                    // the content. That is every editor that saves
+                                    // atomically — vim, VS Code, most build tools.
+                                    //
+                                    // The row already carries the name the file ended
+                                    // up with, so correct the remote to match.
+                                    let mut updated = updated;
+                                    if current.name != item.name
+                                        || current.parent_id != item.parent_id
+                                    {
+                                        if let Some(parent) = current.parent_id.clone() {
+                                            info!(
+                                                "{} was renamed to {} while uploading — \
+                                                 moving it on OneDrive to match",
+                                                item.name, current.name
+                                            );
+                                            match graph
+                                                .move_item(&updated.id, &parent, &current.name)
+                                                .await
+                                            {
+                                                Ok(moved) => updated = moved,
+                                                Err(e) => error!(
+                                                    "could not rename {} to {} on OneDrive: \
+                                                     {e} — the next delta will rename the \
+                                                     local file back",
+                                                    item.name, current.name
+                                                ),
+                                            }
+                                        }
+                                    }
+
                                     let mut updated_item = current;
                                     updated_item.size = new_size;
                                     updated_item.etag = updated.e_tag;
@@ -1351,7 +1389,13 @@ impl Filesystem for OneDriveFS {
                 updated.name = new_name.to_string();
                 updated.local_path = new_local_path;
                 updated.parent_id = Some(new_parent_drive_id);
-                let _ = self.db.delete_item(&item.id).await;
+                // No delete first: `upsert_item` already evicts whatever else
+                // holds the new path and updates this row in place. Deleting
+                // opened a window in which the row did not exist at all — and
+                // an upload of this very file is typically still in flight
+                // during an atomic save. If it completed inside that window it
+                // would read "no row" as "deleted while uploading" and remove
+                // the file from OneDrive.
                 if let Err(e) = self.db.upsert_item(&updated).await {
                     warn!("Failed to upsert renamed temp item: {e}");
                 }
