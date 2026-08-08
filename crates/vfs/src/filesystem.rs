@@ -14,7 +14,7 @@ use graph_client::GraphClient;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::OsStr,
-    os::unix::fs::FileExt,
+    os::unix::fs::{FileExt, MetadataExt},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -92,6 +92,12 @@ pub struct OneDriveFS {
     /// walk all of them before it can say so. Caching briefly turns a screenful
     /// of folders re-asking into one query each.
     folder_state_cache: RwLock<HashMap<String, (SyncState, std::time::Instant)>>,
+    /// item_id -> POSIX mode, for items whose mode is not the default.
+    ///
+    /// A std lock rather than a tokio one on purpose: `db_item_to_attr` is
+    /// synchronous and is on every stat, so the mode has to be readable without
+    /// awaiting. Nothing awaits while this is held.
+    modes: Arc<std::sync::RwLock<HashMap<String, u32>>>,
     fh_counter: AtomicU64,
     sync_dir: std::path::PathBuf,
     /// Local directory for caching downloaded on-demand files.
@@ -127,6 +133,18 @@ impl OneDriveFS {
             .unwrap_or(None)
             .unwrap_or_default();
 
+        // Remembered modes, loaded once. Every stat reads this map, so it must
+        // not be a query.
+        let modes: HashMap<String, u32> = db
+            .all_modes()
+            .await
+            .unwrap_or_else(|e| {
+                warn!("could not load saved modes ({e}) — defaults will be used");
+                Vec::new()
+            })
+            .into_iter()
+            .collect();
+
         Ok(Self {
             db,
             graph,
@@ -136,6 +154,7 @@ impl OneDriveFS {
             dirty_fhs: RwLock::new(HashSet::new()),
             excluded_patterns,
             folder_state_cache: RwLock::new(HashMap::new()),
+            modes: Arc::new(std::sync::RwLock::new(modes)),
             fh_counter: AtomicU64::new(1),
             sync_dir,
             cache_dir,
@@ -246,7 +265,18 @@ impl OneDriveFS {
         } else {
             FileType::RegularFile
         };
-        let perm: u16 = if item.is_folder { 0o755 } else { 0o644 };
+        // A mode the user set beats the default. OneDrive cannot store one, so
+        // it is remembered locally -- without that, `chmod +x` returned success
+        // and changed nothing, and an executable script silently stopped being
+        // executable.
+        let default_perm: u16 = if item.is_folder { 0o755 } else { 0o644 };
+        let perm: u16 = self
+            .modes
+            .read()
+            .ok()
+            .and_then(|m| m.get(&item.id).copied())
+            .map(|m| (m & 0o7777) as u16)
+            .unwrap_or(default_perm);
 
         let mtime = item
             .modified_at
@@ -275,18 +305,26 @@ impl OneDriveFS {
         // A cache file is only ever whole: downloads land via rename from a
         // `.tmp`, so its length is either the remote content or a local edit
         // that is ahead of it. Either way it beats the row.
-        let (size, mtime) = match std::fs::metadata(self.cache_dir.join(&item.id)) {
+        // `blocks` is reported from the cached copy, not computed from `size`.
+        // A placeholder holds no content, and saying otherwise makes `du -sh`
+        // report the full cloud size -- so on-demand cannot be seen to be
+        // working even when it is, and any disk-pressure policy built on those
+        // numbers is reading fiction.
+        let (size, mtime, blocks) = match std::fs::metadata(self.cache_dir.join(&item.id)) {
             Ok(meta) if !item.is_folder => (
                 meta.len(),
                 meta.modified().map(sys_time_to_ts).unwrap_or(mtime),
+                meta.blocks(),
             ),
-            _ => (item.size, mtime),
+            // No cached copy: metadata only, and it occupies nothing.
+            _ if !item.is_folder => (item.size, mtime, 0),
+            _ => (item.size, mtime, item.size.div_ceil(512)),
         };
 
         FileAttr {
             ino,
             size,
-            blocks: size.div_ceil(512),
+            blocks,
             atime: mtime,
             mtime,
             ctime,
@@ -576,7 +614,26 @@ impl Filesystem for OneDriveFS {
             }
         }
 
-        // For everything else (times, mode, uid, gid) just return current attrs.
+        // A mode change is real work, not something to nod at. Accepting it and
+        // discarding it made `chmod +x` return success and change nothing, so
+        // an executable file stopped being executable with nothing to point at.
+        if let Some(mode) = set_attr.mode {
+            let item_id = {
+                let map = self.inodes.read().await;
+                map.get(&inode).map(|e| e.item_id.clone())
+            };
+            if let Some(item_id) = item_id {
+                if let Err(e) = self.db.set_mode(&item_id, mode).await {
+                    error!("could not persist mode for {item_id}: {e}");
+                    return Err(libc::EIO.into());
+                }
+                if let Ok(mut m) = self.modes.write() {
+                    m.insert(item_id, mode);
+                }
+            }
+        }
+
+        // For everything else (times, uid, gid) just return current attrs.
         match self.attr_for_inode(inode).await {
             Some(attr) => Ok(ReplyAttr {
                 ttl: std::time::Duration::from_secs(TTL_SEC),
@@ -805,6 +862,32 @@ impl Filesystem for OneDriveFS {
             .await
             {
                 Ok(Ok(_)) => {
+                    // A download that finished is not the same as a download
+                    // that brought what was promised. If the object changed on
+                    // OneDrive after this placeholder was recorded, the stream
+                    // ends early and the reader is handed a silently truncated
+                    // file — the size it asked about and the bytes it got do
+                    // not agree, and nothing says so.
+                    //
+                    // The placeholder is either filled with what it promised or
+                    // left alone. There is no third outcome: a partly filled
+                    // cache file looks hydrated and is not, and `getattr`
+                    // answers from it, so leaving one behind would make the
+                    // wrong size durable.
+                    let landed = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    if landed != item.size {
+                        warn!(
+                            "{id}: hydration brought {landed} bytes for an object \
+                             recorded as {} — discarding it and asking for a \
+                             fresh delta rather than serving a truncated file",
+                            item.size
+                        );
+                        let _ = std::fs::remove_file(&path);
+                        // The row is what disagreed, so it must not be trusted
+                        // as hydrated. Leaving is_placeholder set means the next
+                        // open tries again, against whatever the next delta says.
+                        return Err(libc::EIO.into());
+                    }
                     if let Err(e) = db.set_placeholder(&id, false).await {
                         warn!("Failed to clear placeholder for {id}: {e}");
                     }
@@ -946,6 +1029,7 @@ impl Filesystem for OneDriveFS {
                     // locally created file returns one — see below.
                     let cache_dir = self.cache_dir.clone();
                     let inodes = Arc::clone(&self.inodes);
+                    let modes = Arc::clone(&self.modes);
                     let id_to_inode = Arc::clone(&self.id_to_inode);
                     let pending = Arc::clone(&self.pending);
 
@@ -1187,6 +1271,32 @@ impl Filesystem for OneDriveFS {
                                                  copy: {e}",
                                                 old_id, updated_item.id
                                             );
+                                        }
+                                    }
+
+                                    // The mode moves with the identity, like the
+                                    // cache file just did. It is keyed by item ID,
+                                    // and adoption changes that ID -- so without
+                                    // this the mode is orphaned under a `_local_*`
+                                    // key nothing will ever ask about again, and a
+                                    // `chmod +x` made before the upload finished
+                                    // quietly stops applying.
+                                    if adopted {
+                                        let carried = modes.write().ok().and_then(|mut m| {
+                                            m.remove(&old_id).inspect(|mode| {
+                                                m.insert(updated_item.id.clone(), *mode);
+                                            })
+                                        });
+                                        if let Some(mode) = carried {
+                                            if let Err(e) =
+                                                db.set_mode(&updated_item.id, mode).await
+                                            {
+                                                warn!(
+                                                    "could not carry mode {mode:o} from \
+                                                     {old_id} to {}: {e}",
+                                                    updated_item.id
+                                                );
+                                            }
                                         }
                                     }
 

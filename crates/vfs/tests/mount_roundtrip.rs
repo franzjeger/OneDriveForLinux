@@ -955,3 +955,265 @@ async fn a_file_deleted_inside_the_quiet_period_never_uploads() {
         "the deleted file is still queued, so it will upload later and come back"
     );
 }
+
+/// A `chmod +x` made before the upload finishes must still apply afterwards.
+///
+/// OneDrive has nowhere to store a mode, so the client keeps it. Two things had
+/// to be true and neither was: the mode had to be persisted at all — `setattr`
+/// accepted it and dropped it, so `chmod +x` returned success and changed
+/// nothing — and it had to survive the upload adopting the real OneDrive ID.
+/// The mode is keyed by item ID, and adoption changes that ID, so a mode set
+/// while the upload was in flight was orphaned under a `_local_*` key nothing
+/// would ever ask about again. The cache file already moves across adoption;
+/// the mode has to move with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chmod_survives_the_upload_that_adopts_a_real_id() {
+    if !fuse_available() {
+        skip("no /dev/fuse or fusermount3 available");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mountpoint = tmp.path().join("mount");
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let server = mock_graph().await;
+    // A created file uploads to its own name, and comes back with a real ID.
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/me/drive/items/root:/run\.sh:/content$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "real-id-for-run-sh",
+            "name": "run.sh",
+            "eTag": "etag-run",
+            "size": 20,
+            "lastModifiedDateTime": "2026-01-05T00:00:00Z",
+            "file": { "mimeType": "application/x-shellscript" },
+            "parentReference": { "id": "root" }
+        })))
+        .mount(&server)
+        .await;
+
+    let graph = test_graph(&server.uri(), tmp.path());
+    let db = Arc::new(Database::open(&tmp.path().join("items.db")).unwrap());
+    let config = Arc::new(test_config(&mountpoint));
+
+    let token = TokenSet {
+        access_token: "test-token".into(),
+        refresh_token: Some("refresh".into()),
+        expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        token_type: "Bearer".into(),
+        scope: "Files.ReadWrite.All".into(),
+    };
+    let auth = Arc::new(AuthManager::for_tests(token, tmp.path().join("t2.json")));
+    let (engine, _events) = SyncEngine::new(
+        Arc::clone(&config),
+        Arc::clone(&db),
+        Arc::clone(&graph),
+        auth,
+        Some(cache_dir.clone()),
+    );
+    engine.sync_once().await.expect("delta pass");
+
+    let fs = vfs::OneDriveFS::new(
+        Arc::clone(&db),
+        Arc::clone(&graph),
+        mountpoint.clone(),
+        cache_dir.clone(),
+        config.excluded_patterns.clone(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("build filesystem");
+
+    let mount_handle = match fuse3::raw::Session::new(fuse3::MountOptions::default())
+        .mount_with_unprivileged(fs, &mountpoint)
+        .await
+    {
+        Ok(handle) => handle,
+        Err(e) => {
+            skip(&format!("could not mount FUSE: {e}"));
+            return;
+        }
+    };
+
+    let mp = mountpoint.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        use std::os::unix::fs::PermissionsExt;
+        let script = mp.join("run.sh");
+        std::fs::write(&script, b"#!/bin/sh\necho hi\n").expect("write script");
+
+        let mut perms = std::fs::metadata(&script).expect("stat").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).expect("chmod +x");
+
+        let after_chmod = std::fs::metadata(&script)
+            .expect("stat after chmod")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            after_chmod, 0o755,
+            "chmod +x returned success and changed nothing — the exec bit was \
+             never applied, so a script the user made executable will not run"
+        );
+    })
+    .await;
+
+    // Let the upload land and adopt the real OneDrive ID.
+    let _ = await_upload(&server, Duration::from_secs(10)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mp = mountpoint.clone();
+    let after = tokio::task::spawn_blocking(move || {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(mp.join("run.sh"))
+            .expect("stat after the upload adopted the real ID")
+            .permissions()
+            .mode()
+            & 0o777
+    })
+    .await;
+
+    let _ = mount_handle.unmount().await;
+    result.expect("the pre-upload half panicked");
+    assert_eq!(
+        after.expect("stat panicked"),
+        0o755,
+        "the mode was lost when the upload adopted the real OneDrive ID — it is \
+         keyed by item ID, and nothing carried it across the swap"
+    );
+}
+
+/// A download that ends early must be refused, not served as a short file.
+///
+/// The placeholder's size comes from the delta pass. If the object changes on
+/// OneDrive before anyone reads it, the download brings a different number of
+/// bytes — and serving those means the reader asked about a file of one size
+/// and received another, with no error. Worse, `getattr` answers from the cache
+/// file, so the wrong size becomes what `stat` reports from then on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_short_download_is_refused_rather_than_served_truncated() {
+    if !fuse_available() {
+        skip("no /dev/fuse or fusermount3 available");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mountpoint = tmp.path().join("mount");
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/me/drive/root"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "root", "name": "root", "folder": { "childCount": 1 }
+        })))
+        .mount(&server)
+        .await;
+    // The delta says 4096 bytes...
+    Mock::given(method("GET"))
+        .and(path("/me/drive/items/root/delta"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "value": [{
+                "id": "short1",
+                "name": "report.pdf",
+                "eTag": "etag-1",
+                "size": 4096,
+                "lastModifiedDateTime": "2026-01-01T00:00:00Z",
+                "file": { "mimeType": "application/pdf" },
+                "parentReference": { "id": "root", "path": "/drive/root:" }
+            }],
+            "@odata.deltaLink": "https://example.invalid/delta?token=next"
+        })))
+        .mount(&server)
+        .await;
+    // ...but the content is half that, as it would be if the object changed.
+    Mock::given(method("GET"))
+        .and(path("/me/drive/items/short1/content"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 2048]))
+        .mount(&server)
+        .await;
+
+    let graph = test_graph(&server.uri(), tmp.path());
+    let db = Arc::new(Database::open(&tmp.path().join("items.db")).unwrap());
+    let config = Arc::new(test_config(&mountpoint));
+
+    let token = TokenSet {
+        access_token: "test-token".into(),
+        refresh_token: Some("refresh".into()),
+        expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        token_type: "Bearer".into(),
+        scope: "Files.ReadWrite.All".into(),
+    };
+    let auth = Arc::new(AuthManager::for_tests(token, tmp.path().join("t2.json")));
+    let (engine, _events) = SyncEngine::new(
+        Arc::clone(&config),
+        Arc::clone(&db),
+        Arc::clone(&graph),
+        auth,
+        Some(cache_dir.clone()),
+    );
+    engine.sync_once().await.expect("delta pass");
+
+    let fs = vfs::OneDriveFS::new(
+        Arc::clone(&db),
+        Arc::clone(&graph),
+        mountpoint.clone(),
+        cache_dir.clone(),
+        config.excluded_patterns.clone(),
+        Duration::ZERO,
+    )
+    .await
+    .expect("build filesystem");
+
+    let mount_handle = match fuse3::raw::Session::new(fuse3::MountOptions::default())
+        .mount_with_unprivileged(fs, &mountpoint)
+        .await
+    {
+        Ok(handle) => handle,
+        Err(e) => {
+            skip(&format!("could not mount FUSE: {e}"));
+            return;
+        }
+    };
+
+    let mp = mountpoint.clone();
+    let cache = cache_dir.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        use std::os::unix::fs::MetadataExt;
+        let file = mp.join("report.pdf");
+
+        // A placeholder holds nothing, and must say so — otherwise `du` claims
+        // disk that is not in use and on-demand cannot be seen to be working.
+        let md = std::fs::metadata(&file).expect("stat placeholder");
+        assert_eq!(md.len(), 4096, "a placeholder must report the real size");
+        assert_eq!(
+            md.blocks(),
+            0,
+            "a placeholder reported {} allocated blocks for content it does not hold",
+            md.blocks()
+        );
+
+        let err = std::fs::read(&file)
+            .expect_err("a download that brought 2048 of 4096 bytes must not be served");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EIO),
+            "expected EIO for a download that disagreed with the placeholder, got {err:?}"
+        );
+
+        assert!(
+            !cache.join("short1").exists(),
+            "the truncated download was left in the cache — it looks hydrated, it \
+             is not, and getattr answers from it"
+        );
+    })
+    .await;
+
+    let _ = mount_handle.unmount().await;
+    result.expect("assertions ran on the mount");
+}
