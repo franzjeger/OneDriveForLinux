@@ -32,6 +32,8 @@ const REMOTE_CONTENT: &[u8] = b"AAAABBBB";
 const WRITTEN_CONTENT: &[u8] = b"CHANGED!";
 /// The version the client believes it has, and must send back as `If-Match`.
 const ETAG: &str = "etag-1";
+/// Content written into a file created through the mount.
+const NEW_CONTENT: &[u8] = b"scaffolded by npm init\n";
 
 /// FUSE needs `/dev/fuse` and `fusermount3`. Both are absent in some build
 /// containers, where the honest outcome is "not run", not "passed".
@@ -290,4 +292,179 @@ async fn edit_through_the_mount_reaches_onedrive() {
         "the upload must be conditional on the version we last synced, or a \
          change made on OneDrive meanwhile is silently overwritten"
     );
+}
+
+/// Creating a file through the mount, which the round trip above never did.
+///
+/// A new file gets a temporary `_local_*` ID and lives only in the cache until
+/// the upload finishes. Three separate bugs lived in that window, and all three
+/// showed up the first time anyone ran `npm init` inside the mount:
+///
+///   * `getattr` answered from the database, so a file that had just been
+///     written stat'd as 0 bytes and read back empty — while `fsync()` returned
+///     success. Tools that write-then-read saw an empty file.
+///   * the real OneDrive ID the upload returned was thrown away, leaving a row
+///     that owned the path under an ID Graph had never issued. Every later delta
+///     collided with it on `local_path`.
+///   * that collision rolled back the whole delta batch, so one created file
+///     could stop sync recording anything at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_created_through_the_mount_is_readable_and_adopts_its_real_id() {
+    if !fuse_available() {
+        skip("no /dev/fuse or fusermount3 available");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mountpoint = tmp.path().join("mount");
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let server = mock_graph().await;
+    // The upload of a newly created file answers with the ID OneDrive assigned.
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/me/drive/items/root:/created\.txt:/content$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "real-id-from-graph",
+            "name": "created.txt",
+            "eTag": "etag-new",
+            "cTag": "ctag-new",
+            "size": NEW_CONTENT.len(),
+            "lastModifiedDateTime": "2026-01-03T00:00:00Z",
+            "file": { "mimeType": "text/plain" },
+            "parentReference": { "id": "root" }
+        })))
+        .mount(&server)
+        .await;
+
+    let graph = test_graph(&server.uri(), tmp.path());
+    let db = Arc::new(Database::open(&tmp.path().join("items.db")).unwrap());
+    let config = Arc::new(test_config(&mountpoint));
+
+    let token = TokenSet {
+        access_token: "test-token".into(),
+        refresh_token: Some("refresh".into()),
+        expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        token_type: "Bearer".into(),
+        scope: "Files.ReadWrite.All".into(),
+    };
+    let auth = Arc::new(AuthManager::for_tests(token, tmp.path().join("t2.json")));
+    let (engine, _events) = SyncEngine::new(
+        Arc::clone(&config),
+        Arc::clone(&db),
+        Arc::clone(&graph),
+        auth,
+        Some(cache_dir.clone()),
+    );
+    // Establishes the root, so the mount has a directory to create into.
+    engine.sync_once().await.expect("delta pass");
+
+    let fs = vfs::OneDriveFS::new(
+        Arc::clone(&db),
+        Arc::clone(&graph),
+        mountpoint.clone(),
+        cache_dir.clone(),
+        config.excluded_patterns.clone(),
+    )
+    .await
+    .expect("build filesystem");
+
+    let mount_handle = match fuse3::raw::Session::new(fuse3::MountOptions::default())
+        .mount_with_unprivileged(fs, &mountpoint)
+        .await
+    {
+        Ok(handle) => handle,
+        Err(e) => {
+            skip(&format!("could not mount FUSE: {e}"));
+            return;
+        }
+    };
+
+    let mp = mountpoint.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let file = mp.join("created.txt");
+
+        // Exactly what a scaffolding tool does: create, write, fsync, close.
+        let mut fh = std::fs::File::create(&file).expect("create through the mount");
+        fh.write_all(NEW_CONTENT).expect("write");
+        fh.sync_all().expect("fsync");
+        drop(fh);
+
+        // Immediately — no waiting for the upload. fsync() said the data was
+        // durable, so stat and read must agree with it right now.
+        let meta = std::fs::metadata(&file).expect("stat the file just written");
+        assert_eq!(
+            meta.len(),
+            NEW_CONTENT.len() as u64,
+            "a file reports {} bytes straight after a successful fsync — this is \
+             what made `npm init` produce an empty package.json",
+            meta.len()
+        );
+
+        let read_back = std::fs::read(&file).expect("read back what was just written");
+        assert_eq!(
+            read_back, NEW_CONTENT,
+            "reading a just-written file must return what was written"
+        );
+    })
+    .await;
+
+    let upload = if result.is_ok() {
+        Some(await_upload(&server, Duration::from_secs(15)).await)
+    } else {
+        None
+    };
+    let _ = mount_handle.unmount().await;
+    result.expect("filesystem operations through the mount");
+    assert_eq!(
+        upload.unwrap().body,
+        NEW_CONTENT,
+        "the created file must reach OneDrive with its content"
+    );
+
+    // ── The real ID must be adopted ────────────────────────────────────────
+    // Poll: the database write happens in the upload's background task.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if db
+            .get_item_by_id("real-id-from-graph")
+            .await
+            .unwrap()
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the row still holds the temporary _local_ ID after the upload \
+             returned a real one — every later delta will collide with it on \
+             local_path"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // ── And a later delta must be able to record over it ────────────────────
+    // This is the failure that stopped sync entirely: the collision aborted the
+    // whole batch, not just the one row.
+    db.upsert_items_batch(vec![sync_engine::DbItem {
+        id: "real-id-from-graph".into(),
+        local_path: mountpoint.join("created.txt"),
+        name: "created.txt".into(),
+        parent_id: Some("root".into()),
+        etag: Some("etag-new".into()),
+        ctag: None,
+        size: NEW_CONTENT.len() as u64,
+        modified_at: None,
+        created_at: None,
+        sha1_hash: None,
+        quick_xor_hash: None,
+        is_folder: false,
+        is_placeholder: false,
+        sync_state: sync_engine::SyncState::Synced,
+        pinned: false,
+    }])
+    .await
+    .expect("a delta pass must be able to record a file created through the mount");
 }

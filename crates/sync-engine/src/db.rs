@@ -858,6 +858,20 @@ impl Database {
             conn.execute_batch("BEGIN")?;
             let result: Result<()> = (|| {
                 for item in &items {
+                    // Evict any row that already owns this path under a different
+                    // ID — the same thing `upsert_item` does. A locally created
+                    // file holds its path under a temporary `_local_*` ID until
+                    // the upload finishes; delta then reports it under its real
+                    // OneDrive ID and the two collide on the unique index.
+                    //
+                    // Without this the INSERT fails, and because the batch is one
+                    // transaction the failure rolls back every other change in it.
+                    // One stale row was enough to stop delta sync recording
+                    // anything at all, for as long as the row existed.
+                    conn.execute(
+                        "DELETE FROM items WHERE local_path = ?1 AND id != ?2",
+                        params![item.local_path.to_string_lossy().as_ref(), item.id],
+                    )?;
                     conn.execute(
                         "INSERT INTO items
                              (id, local_path, name, parent_id, etag, ctag, size,
@@ -1131,10 +1145,10 @@ fn row_to_item(row: &rusqlite::Row) -> Result<DbItem> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn test_item(id: &str, path: &str) -> DbItem {
+    pub(crate) fn test_item(id: &str, path: &str) -> DbItem {
         DbItem {
             id: id.to_string(),
             local_path: PathBuf::from(path),
@@ -1158,7 +1172,7 @@ mod tests {
         }
     }
 
-    fn open_temp_db() -> (tempfile::TempDir, Database) {
+    pub(crate) fn open_temp_db() -> (tempfile::TempDir, Database) {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("test.db")).unwrap();
         (dir, db)
@@ -1644,5 +1658,71 @@ mod tests {
         assert_eq!(db.get_symlinks_in(parent).await.unwrap().len(), 1);
         db.delete_symlink(parent, "link").await.unwrap();
         assert!(db.get_symlink(parent, "link").await.unwrap().is_none());
+    }
+}
+
+/// A locally created file gets a temporary `_local_*` ID and owns its
+/// `local_path` until the upload finishes. When delta later reports the same
+/// file under its real OneDrive ID, the two rows collide on the `local_path`
+/// unique index.
+///
+/// `upsert_item` has always resolved that by evicting the stale row.
+/// `upsert_items_batch` — the path delta sync actually uses — did not, and
+/// because the whole batch runs in one transaction, a single collision rolled
+/// back *every* change in it. One stale row was enough to stop delta sync from
+/// recording anything, indefinitely.
+#[cfg(test)]
+mod batch_collision_tests {
+    use super::tests::*;
+    use super::*;
+
+    #[tokio::test]
+    async fn batch_replaces_a_row_that_already_owns_the_path() {
+        let (_dir, db) = open_temp_db();
+        db.upsert_item(&test_item("_local_1", "/sync/notes.txt"))
+            .await
+            .unwrap();
+
+        db.upsert_items_batch(vec![test_item("real-id", "/sync/notes.txt")])
+            .await
+            .expect("delta must be able to record the real item over the local one");
+
+        let by_path = db
+            .get_item_by_path(Path::new("/sync/notes.txt"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            by_path.id, "real-id",
+            "the real OneDrive ID must take over the path"
+        );
+        assert!(
+            db.get_item_by_id("_local_1").await.unwrap().is_none(),
+            "the superseded local row must be gone, or it collides again next delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_collision_does_not_discard_the_rest_of_the_batch() {
+        let (_dir, db) = open_temp_db();
+        db.upsert_item(&test_item("_local_1", "/sync/notes.txt"))
+            .await
+            .unwrap();
+
+        db.upsert_items_batch(vec![
+            test_item("other-a", "/sync/a.txt"),
+            test_item("real-id", "/sync/notes.txt"),
+            test_item("other-b", "/sync/b.txt"),
+        ])
+        .await
+        .unwrap();
+
+        for id in ["other-a", "other-b"] {
+            assert!(
+                db.get_item_by_id(id).await.unwrap().is_some(),
+                "{id} shared a batch with a collision and was rolled back with it — \
+                 this is how one stale row silently stopped delta sync entirely"
+            );
+        }
     }
 }
