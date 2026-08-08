@@ -130,6 +130,16 @@ impl Database {
                  created_at  TEXT NOT NULL
              );
 
+             -- POSIX mode for items whose mode differs from the default.
+             -- Local-only: OneDrive does not store a mode, so without this a
+             -- `chmod +x` is lost the moment the attribute is next answered
+             -- from the database -- and an executable script silently stops
+             -- being executable.
+             CREATE TABLE IF NOT EXISTS local_modes (
+                 item_id TEXT PRIMARY KEY,
+                 mode    INTEGER NOT NULL
+             );
+
              CREATE TABLE IF NOT EXISTS local_symlinks (
                  parent_path TEXT NOT NULL,
                  name        TEXT NOT NULL,
@@ -640,6 +650,9 @@ impl Database {
         let id = id.to_string();
         self.with_conn(move |conn| {
             conn.execute("DELETE FROM items WHERE id = ?1", params![id])?;
+            // The mode goes with the item. An id that came back with a stale
+            // mode attached would be worse than having no mode at all.
+            conn.execute("DELETE FROM local_modes WHERE item_id = ?1", params![id])?;
             Ok(())
         })
         .await
@@ -680,6 +693,38 @@ impl Database {
     /// Uploads are queued in the database rather than held in memory so a
     /// failure survives a daemon restart: a file the user saved must not be
     /// silently left un-uploaded because the network blipped.
+    /// Remember a POSIX mode that differs from the default.
+    ///
+    /// The cloud has nowhere to put this, so it lives here or it is lost. The
+    /// exec bit is the one that matters: losing it turns a working script into
+    /// one that will not run, with nothing to point at.
+    pub async fn set_mode(&self, id: &str, mode: u32) -> Result<()> {
+        let id = id.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO local_modes (item_id, mode) VALUES (?1, ?2)
+                 ON CONFLICT(item_id) DO UPDATE SET mode = excluded.mode",
+                params![id, mode as i64],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Every remembered mode, for loading into memory when the mount starts.
+    pub async fn all_modes(&self) -> Result<Vec<(String, u32)>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare("SELECT item_id, mode FROM local_modes")?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u32))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+    }
+
     pub async fn enqueue_upload(&self, entry: &PendingUpload) -> Result<()> {
         let entry = entry.clone();
         self.with_conn(move |conn| {
