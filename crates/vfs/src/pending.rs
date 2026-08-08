@@ -142,6 +142,16 @@ impl PendingUploads {
         }
     }
 
+    /// Whether this item has an upload waiting or in flight.
+    ///
+    /// An upload rewrites the cache file it is uploading from — adopting the
+    /// real OneDrive ID renames it — so "the cache file is missing" does not
+    /// mean "the content is gone" while one is running.
+    pub async fn is_active(&self, item_id: &str) -> bool {
+        let state = self.state.lock().await;
+        state.due.contains_key(item_id) || state.in_flight.contains(item_id)
+    }
+
     /// Edits waiting or in flight — what the UI means by "not yet uploaded".
     pub async fn count(&self) -> usize {
         let state = self.state.lock().await;

@@ -162,6 +162,27 @@ async fn await_upload(server: &MockServer, within: Duration) -> wiremock::Reques
     }
 }
 
+/// Whether the saved file ended up on OneDrive under its real name — either
+/// because the upload addressed it correctly, or because a rename corrected it
+/// afterwards. Both are right; only the destination matters.
+async fn await_named_correctly(server: &MockServer, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        let requests = server.received_requests().await.unwrap_or_default();
+        let landed = requests.iter().any(|r| {
+            (r.method.as_str() == "PUT" && r.url.path().contains("notes.md:"))
+                || r.method.as_str() == "PATCH"
+        });
+        if landed {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Whether a request with the given method reached the server in time.
 async fn await_request(server: &MockServer, verb: &str, within: Duration) -> bool {
     let deadline = Instant::now() + within;
@@ -693,7 +714,22 @@ async fn an_atomic_save_leaves_the_file_under_its_real_name() {
         )
         .mount(&server)
         .await;
-    // Correcting the remote name is a PATCH on the item.
+    // The upload re-reads the row after waiting, so it often addresses the final
+    // name directly — the case the debounce is for.
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/me/drive/items/root:/notes\.md:/content$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "saved-item",
+            "name": "notes.md",
+            "eTag": "etag-final",
+            "size": NEW_CONTENT.len(),
+            "lastModifiedDateTime": "2026-01-05T00:00:01Z",
+            "file": { "mimeType": "text/markdown" },
+            "parentReference": { "id": "root" }
+        })))
+        .mount(&server)
+        .await;
+    // And when it does go out under the temp name, a PATCH corrects it.
     Mock::given(method("PATCH"))
         .and(path("/me/drive/items/saved-item"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -782,11 +818,12 @@ async fn an_atomic_save_leaves_the_file_under_its_real_name() {
 
     // Let the in-flight upload finish and correct itself.
     let outcome = if result.is_ok() {
-        let renamed_remotely = await_request(&server, "PATCH", Duration::from_secs(15)).await;
+        // Either route is correct; what matters is where the file ends up.
+        let landed = await_named_correctly(&server, Duration::from_secs(15)).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
         let row = db.get_item_by_id("saved-item").await.unwrap();
         Some((
-            renamed_remotely,
+            landed,
             row,
             mountpoint.join("notes.md").exists(),
             mountpoint.join("notes.md.tmp.194149").exists(),
@@ -797,12 +834,11 @@ async fn an_atomic_save_leaves_the_file_under_its_real_name() {
     let _ = mount_handle.unmount().await;
     result.expect("filesystem operations through the mount");
 
-    let (renamed_remotely, row, target_there, temp_there) = outcome.unwrap();
+    let (landed, row, target_there, temp_there) = outcome.unwrap();
     assert!(
-        renamed_remotely,
-        "the upload started under the temp name and was never corrected, so \
-         OneDrive holds the file as `notes.md.tmp.194149` — the next delta renames \
-         the local file back to that and the saved file disappears"
+        landed,
+        "OneDrive ended up holding the file as `notes.md.tmp.194149` — the next \
+         delta renames the local file back to that and the saved file disappears"
     );
     let row = row.expect("the saved file must still have a row");
     assert_eq!(

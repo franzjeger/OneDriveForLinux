@@ -360,19 +360,29 @@ impl OneDriveFS {
     }
 
     /// Resolve current attributes for any inode: root, regular item, or symlink.
+    /// The row behind an inode.
+    ///
+    /// The inode lock is held across the query on purpose. An upload that
+    /// adopts the real OneDrive ID has to move the row from the temporary
+    /// `_local_*` ID to the real one, and `local_path` is unique, so the two
+    /// rows can never both exist — read the ID, then query, and a swap that
+    /// lands between the two makes a file the user just wrote look deleted.
+    ///
+    /// Adoption takes the same lock for writing across its own update, so a
+    /// reader sees either the whole "before" or the whole "after".
+    async fn resolve_item(&self, inode: u64) -> Option<DbItem> {
+        let map = self.inodes.read().await;
+        let item_id = map.get(&inode).map(|e| e.item_id.clone())?;
+        self.db.get_item_by_id(&item_id).await.ok().flatten()
+    }
+
     async fn attr_for_inode(&self, inode: u64) -> Option<FileAttr> {
         if inode == 1 {
             return Some(self.root_attr());
         }
 
-        let item_id = {
-            let map = self.inodes.read().await;
-            map.get(&inode).map(|e| e.item_id.clone())
-        };
-        if let Some(id) = item_id {
-            if let Ok(Some(item)) = self.db.get_item_by_id(&id).await {
-                return Some(self.db_item_to_attr(&item, inode));
-            }
+        if let Some(item) = self.resolve_item(inode).await {
+            return Some(self.db_item_to_attr(&item, inode));
         }
 
         let map = self.symlink_inodes.read().await;
@@ -768,18 +778,8 @@ impl Filesystem for OneDriveFS {
     async fn open(&self, _req: Request, inode: u64, flags: u32) -> FuseResult<ReplyOpen> {
         debug!("open inode={inode} flags={flags:#o}");
 
-        let item_id = {
-            let map = self.inodes.read().await;
-            map.get(&inode).map(|e| e.item_id.clone())
-        };
-        let item_id = item_id.ok_or(libc::ENOENT)?;
-
-        let item = self
-            .db
-            .get_item_by_id(&item_id)
-            .await
-            .map_err(|_| libc::EIO)?
-            .ok_or(libc::ENOENT)?;
+        let item = self.resolve_item(inode).await.ok_or(libc::ENOENT)?;
+        let item_id = item.id.clone();
 
         // Cache file lives OUTSIDE the FUSE mountpoint to avoid recursive FUSE calls.
         let cache_path = self.cache_dir.join(&item_id);
@@ -1127,10 +1127,59 @@ impl Filesystem for OneDriveFS {
                                     // so one created file could stop sync dead.
                                     let old_id =
                                         std::mem::replace(&mut updated_item.id, updated.id.clone());
-                                    if old_id != updated_item.id {
+                                    let adopted = old_id != updated_item.id;
+                                    if adopted {
+                                        // The row moves to the new ID *before* the
+                                        // cache file does.
+                                        //
+                                        // Renaming first left a window where the
+                                        // row still said `_local_*` and its cache
+                                        // file was already gone — which a read
+                                        // landing there treats as a file with no
+                                        // content anywhere, and drops the row for.
+                                        // A file could vanish moments after being
+                                        // written, purely because it happened to be
+                                        // uploading at the time.
+                                        //
+                                        // Moving the row first makes the window
+                                        // harmless: the ID is real, so a read
+                                        // inside it fetches from OneDrive, which
+                                        // now holds the content.
+                                        // Both halves of the swap under the
+                                        // inode lock, which resolve_item holds
+                                        // across its query — so no read can land
+                                        // between the row moving and the inode
+                                        // following it.
+                                        {
+                                            let mut entries = inodes.write().await;
+                                            // Re-read once more, inside the lock.
+                                            // The earlier read was before a network
+                                            // call; a rename landing since then
+                                            // would otherwise be overwritten by the
+                                            // name this upload started with, and
+                                            // the saved file would look missing
+                                            // until the next delta.
+                                            if let Ok(Some(latest)) =
+                                                db.get_item_by_id(&old_id).await
+                                            {
+                                                updated_item.name = latest.name;
+                                                updated_item.local_path = latest.local_path;
+                                                updated_item.parent_id = latest.parent_id;
+                                            }
+                                            if let Err(e) = db.upsert_item(&updated_item).await {
+                                                error!("Failed to adopt the real ID: {e}");
+                                            }
+                                            let mut ids = id_to_inode.write().await;
+                                            if let Some(ino) = ids.remove(&old_id) {
+                                                ids.insert(updated_item.id.clone(), ino);
+                                                if let Some(entry) = entries.get_mut(&ino) {
+                                                    entry.item_id = updated_item.id.clone();
+                                                }
+                                            }
+                                        }
                                         // The cache file is named after the ID, so
                                         // it has to move with it or the next open()
-                                        // finds nothing and the file reads as EIO.
+                                        // re-fetches content we already have.
                                         let new_cache = cache_dir.join(&updated_item.id);
                                         if let Err(e) = std::fs::rename(&cache_path, &new_cache) {
                                             error!(
@@ -1139,22 +1188,13 @@ impl Filesystem for OneDriveFS {
                                                 old_id, updated_item.id
                                             );
                                         }
-                                        // Repoint the inode the kernel already
-                                        // handed out; it must keep resolving.
-                                        let mut ids = id_to_inode.write().await;
-                                        if let Some(ino) = ids.remove(&old_id) {
-                                            ids.insert(updated_item.id.clone(), ino);
-                                            if let Some(entry) = inodes.write().await.get_mut(&ino)
-                                            {
-                                                entry.item_id = updated_item.id.clone();
-                                            }
-                                        }
                                     }
 
-                                    // `upsert_item` evicts whatever else owns this
-                                    // path, which is how the old `_local_*` row goes.
-                                    if let Err(e) = db.upsert_item(&updated_item).await {
-                                        error!("Failed to upsert item after upload: {e}");
+                                    // Already written above when adopting a new ID.
+                                    if !adopted {
+                                        if let Err(e) = db.upsert_item(&updated_item).await {
+                                            error!("Failed to upsert item after upload: {e}");
+                                        }
                                     }
                                     info!(
                                         "upload complete: {} ({} bytes)",
