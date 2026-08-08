@@ -14,7 +14,7 @@ use graph_client::GraphClient;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ffi::OsStr,
-    os::unix::fs::FileExt,
+    os::unix::fs::{FileExt, PermissionsExt},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -246,7 +246,7 @@ impl OneDriveFS {
         } else {
             FileType::RegularFile
         };
-        let perm: u16 = if item.is_folder { 0o755 } else { 0o644 };
+        // `perm` is computed below, once the cached copy has been consulted.
 
         let mtime = item
             .modified_at
@@ -275,12 +275,22 @@ impl OneDriveFS {
         // A cache file is only ever whole: downloads land via rename from a
         // `.tmp`, so its length is either the remote content or a local edit
         // that is ahead of it. Either way it beats the row.
-        let (size, mtime) = match std::fs::metadata(self.cache_dir.join(&item.id)) {
+        let (size, mtime, executable) = match std::fs::metadata(self.cache_dir.join(&item.id)) {
             Ok(meta) if !item.is_folder => (
                 meta.len(),
                 meta.modified().map(sys_time_to_ts).unwrap_or(mtime),
+                // The cached copy carries the mode, so this costs nothing on
+                // top of the stat already being done. OneDrive has no POSIX
+                // mode of its own; this is the only place it lives.
+                std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o111 != 0,
             ),
-            _ => (item.size, mtime),
+            _ => (item.size, mtime, false),
+        };
+
+        let perm: u16 = if item.is_folder || executable {
+            0o755
+        } else {
+            0o644
         };
 
         FileAttr {
@@ -576,7 +586,37 @@ impl Filesystem for OneDriveFS {
             }
         }
 
-        // For everything else (times, mode, uid, gid) just return current attrs.
+        // chmod. Only the executable bit is honoured — OneDrive stores no mode,
+        // and read/write are governed by the mount, not by us. But the exec bit
+        // has to stick: a build system writes a script, marks it executable and
+        // runs it. Accepting the chmod and changing nothing made that fail with
+        // "permission denied" and no way to see why, since `chmod` reported
+        // success and `ls -l` kept saying 644.
+        if let Some(mode) = set_attr.mode {
+            let item_id = {
+                let map = self.inodes.read().await;
+                map.get(&inode).map(|e| e.item_id.clone())
+            };
+            if let Some(item_id) = item_id {
+                let executable = mode & 0o111 != 0;
+                let cache_path = self.cache_dir.join(&item_id);
+                if cache_path.exists() {
+                    let perms =
+                        std::fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 });
+                    if let Err(e) = std::fs::set_permissions(&cache_path, perms) {
+                        error!("chmod {cache_path:?}: {e}");
+                        return Err(libc::EIO.into());
+                    }
+                }
+                // Also recorded in the database: a later download replaces the
+                // cached copy, and the mode would go with it.
+                if let Err(e) = self.db.set_executable(&item_id, executable).await {
+                    error!("could not record the executable bit for {item_id}: {e}");
+                }
+            }
+        }
+
+        // For everything else (times, uid, gid) just return current attrs.
         match self.attr_for_inode(inode).await {
             Some(attr) => Ok(ReplyAttr {
                 ttl: std::time::Duration::from_secs(TTL_SEC),
@@ -807,6 +847,14 @@ impl Filesystem for OneDriveFS {
                 Ok(Ok(_)) => {
                     if let Err(e) = db.set_placeholder(&id, false).await {
                         warn!("Failed to clear placeholder for {id}: {e}");
+                    }
+                    // The download wrote a fresh file, so any mode the user set
+                    // went with the old one. Put it back.
+                    if db.is_executable(&id).await.unwrap_or(false) {
+                        let perms = std::fs::Permissions::from_mode(0o755);
+                        if let Err(e) = std::fs::set_permissions(&path, perms) {
+                            warn!("could not restore the executable bit on {id}: {e}");
+                        }
                     }
                 }
                 Ok(Err(e)) => {
@@ -1168,6 +1216,12 @@ impl Filesystem for OneDriveFS {
                                             }
                                             if let Err(e) = db.upsert_item(&updated_item).await {
                                                 error!("Failed to adopt the real ID: {e}");
+                                            }
+                                            // The mode is keyed by ID too.
+                                            if let Err(e) =
+                                                db.move_executable(&old_id, &updated_item.id).await
+                                            {
+                                                warn!("could not carry the executable bit: {e}");
                                             }
                                             let mut ids = id_to_inode.write().await;
                                             if let Some(ino) = ids.remove(&old_id) {
