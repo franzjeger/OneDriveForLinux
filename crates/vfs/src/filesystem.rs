@@ -955,7 +955,26 @@ impl Filesystem for OneDriveFS {
                     // a minute. Uploading on close made all three race their own
                     // upload. Waiting means the upload sees the settled result.
                     let waiter_id = id.clone();
-                    if !pending.schedule(&waiter_id, self.upload_debounce).await {
+                    let scheduled = pending.schedule(&waiter_id, self.upload_debounce).await;
+                    // release() is asynchronous with respect to close(), so an
+                    // unlink of this file can land between the row check above
+                    // and the schedule above. It would cancel an entry that did
+                    // not exist yet, and this one would then sit out the whole
+                    // window for a file that is gone — never uploading, since it
+                    // re-reads the row first, but counting as unsent the whole
+                    // time. Re-check now that the entry is in.
+                    if self
+                        .db
+                        .get_item_by_id(&waiter_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_none()
+                    {
+                        pending.cancel(&waiter_id).await;
+                        return Ok(());
+                    }
+                    if !scheduled {
                         // Already waiting — that call just pushed its deadline
                         // out, and the existing waiter will upload the newer
                         // content from the same cache file.
@@ -1312,12 +1331,16 @@ impl Filesystem for OneDriveFS {
                     warn!("Failed to delete remote item {}: {e}", item.id);
                 }
             }
-            // Drop any edit still waiting to upload. Without this the wait
-            // would expire after the file was gone and put it back.
-            self.pending.cancel(&item.id).await;
             if let Err(e) = self.db.delete_item(&item.id).await {
                 warn!("Failed to delete DB item {}: {e}", item.id);
             }
+            // Drop any edit still waiting to upload — otherwise the wait expires
+            // after the file is gone and puts it back.
+            //
+            // Deliberately after the row is deleted, so this and release()'s
+            // re-check cover each other: whichever of the two runs last finds
+            // the state the other left and cleans up.
+            self.pending.cancel(&item.id).await;
             // Remove the cache file if present. Do NOT touch item.local_path — it is
             // inside the FUSE mount and accessing it from the daemon causes a recursive
             // FUSE deadlock. The kernel removes the FUSE entry when we return Ok(()).
