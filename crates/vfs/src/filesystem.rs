@@ -104,6 +104,10 @@ pub struct OneDriveFS {
     symlink_inodes: RwLock<BTreeMap<u64, SymlinkEntry>>,
     /// (parent_inode, name) → symlink inode for fast lookup
     symlink_lookup: RwLock<BTreeMap<(u64, String), u64>>,
+    /// Edits waiting out their quiet period before upload.
+    pending: Arc<crate::pending::PendingUploads>,
+    /// How long a file must go untouched before its edit is uploaded.
+    upload_debounce: std::time::Duration,
 }
 
 impl OneDriveFS {
@@ -113,6 +117,7 @@ impl OneDriveFS {
         sync_dir: std::path::PathBuf,
         cache_dir: std::path::PathBuf,
         excluded_patterns: Vec<String>,
+        upload_debounce: std::time::Duration,
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&cache_dir)
             .map_err(|e| anyhow::anyhow!("create cache dir {:?}: {e}", cache_dir))?;
@@ -137,7 +142,17 @@ impl OneDriveFS {
             root_drive_id: RwLock::new(root_drive_id),
             symlink_inodes: RwLock::new(BTreeMap::new()),
             symlink_lookup: RwLock::new(BTreeMap::new()),
+            pending: Arc::new(crate::pending::PendingUploads::new()),
+            upload_debounce,
         })
+    }
+
+    /// The queue of edits waiting to upload.
+    ///
+    /// Taken before the filesystem is handed to the FUSE session, which
+    /// consumes it — the daemon needs this to flush on shutdown.
+    pub fn pending_uploads(&self) -> Arc<crate::pending::PendingUploads> {
+        Arc::clone(&self.pending)
     }
 
     fn next_fh(&self) -> u64 {
@@ -932,10 +947,39 @@ impl Filesystem for OneDriveFS {
                     let cache_dir = self.cache_dir.clone();
                     let inodes = Arc::clone(&self.inodes);
                     let id_to_inode = Arc::clone(&self.id_to_inode);
+                    let pending = Arc::clone(&self.pending);
+
+                    // Wait for the file to go quiet first. An atomic save closes
+                    // a temp file it is about to rename away; a scratch file may
+                    // be deleted seconds later; an editor may save ten times in
+                    // a minute. Uploading on close made all three race their own
+                    // upload. Waiting means the upload sees the settled result.
+                    let waiter_id = id.clone();
+                    if !pending.schedule(&waiter_id, self.upload_debounce).await {
+                        // Already waiting — that call just pushed its deadline
+                        // out, and the existing waiter will upload the newer
+                        // content from the same cache file.
+                        return Ok(());
+                    }
 
                     // Upload in background — release() must return immediately so
                     // the kernel doesn't block the calling process (e.g. Dolphin).
                     tokio::spawn(async move {
+                        if !pending.wait_until_due(&waiter_id).await {
+                            debug!("upload of {waiter_id} cancelled while waiting");
+                            return;
+                        }
+                        let _in_flight = pending.begin_upload(&waiter_id).await;
+
+                        // Re-read: the file has had the whole quiet period to be
+                        // renamed, and the name is what the upload is addressed by.
+                        let item = match db.get_item_by_id(&waiter_id).await {
+                            Ok(Some(current)) => current,
+                            _ => {
+                                debug!("{waiter_id} no longer exists — nothing to upload");
+                                return;
+                            }
+                        };
                         if let Some(parent_id) = item.parent_id.clone() {
                             // If-Match on the ETag we last synced. Without it an
                             // upload is last-writer-wins: a file changed on
@@ -1268,6 +1312,9 @@ impl Filesystem for OneDriveFS {
                     warn!("Failed to delete remote item {}: {e}", item.id);
                 }
             }
+            // Drop any edit still waiting to upload. Without this the wait
+            // would expire after the file was gone and put it back.
+            self.pending.cancel(&item.id).await;
             if let Err(e) = self.db.delete_item(&item.id).await {
                 warn!("Failed to delete DB item {}: {e}", item.id);
             }

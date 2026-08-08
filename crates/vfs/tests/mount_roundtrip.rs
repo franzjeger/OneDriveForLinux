@@ -80,6 +80,7 @@ fn test_config(sync_dir: &Path) -> Config {
         max_download_threads: 1,
         delta_poll_interval_secs: 3600,
         max_cache_size_gb: 0.0,
+        upload_debounce_secs: 0,
         auth_method: "device_code".into(),
     }
 }
@@ -230,6 +231,9 @@ async fn edit_through_the_mount_reaches_onedrive() {
         mountpoint.clone(),
         cache_dir.clone(),
         config.excluded_patterns.clone(),
+        // No debounce: these tests assert on what reaches OneDrive, and the
+        // debounce is covered by its own tests in `pending`.
+        Duration::ZERO,
     )
     .await
     .expect("build filesystem");
@@ -381,6 +385,9 @@ async fn a_file_created_through_the_mount_is_readable_and_adopts_its_real_id() {
         mountpoint.clone(),
         cache_dir.clone(),
         config.excluded_patterns.clone(),
+        // No debounce: these tests assert on what reaches OneDrive, and the
+        // debounce is covered by its own tests in `pending`.
+        Duration::ZERO,
     )
     .await
     .expect("build filesystem");
@@ -563,6 +570,9 @@ async fn deleting_a_file_while_its_upload_is_in_flight_makes_the_delete_win() {
         mountpoint.clone(),
         cache_dir.clone(),
         config.excluded_patterns.clone(),
+        // No debounce: these tests assert on what reaches OneDrive, and the
+        // debounce is covered by its own tests in `pending`.
+        Duration::ZERO,
     )
     .await
     .expect("build filesystem");
@@ -579,20 +589,34 @@ async fn deleting_a_file_while_its_upload_is_in_flight_makes_the_delete_win() {
     };
 
     let mp = mountpoint.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let written = tokio::task::spawn_blocking(move || {
         use std::io::Write;
-        let file = mp.join("churn.bin");
-        let mut fh = std::fs::File::create(&file).expect("create");
+        let mut fh = std::fs::File::create(mp.join("churn.bin")).expect("create");
         fh.write_all(NEW_CONTENT).expect("write");
         drop(fh);
-        // Immediately, inside the upload window — the case that failed.
-        std::fs::remove_file(&file).expect("delete right after writing");
+    })
+    .await;
+
+    // Delete only once the upload is genuinely in flight. The mock holds the
+    // PUT open for 2s, so waiting for the request to arrive puts the unlink
+    // squarely inside the window — rather than relying on it losing a race it
+    // is now designed to win.
+    let started = await_request(&server, "PUT", Duration::from_secs(15)).await;
+    let mp = mountpoint.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let file = mp.join("churn.bin");
+        std::fs::remove_file(&file).expect("delete while the upload is in flight");
         assert!(
             !file.exists(),
             "the file must be gone the moment unlink() returns"
         );
     })
     .await;
+    written.expect("write through the mount");
+    assert!(
+        started,
+        "the upload never started, so there was no window to test"
+    );
 
     // Outlast the upload, so the completion path has run.
     let outcome = if result.is_ok() {
@@ -711,6 +735,9 @@ async fn an_atomic_save_leaves_the_file_under_its_real_name() {
         mountpoint.clone(),
         cache_dir.clone(),
         config.excluded_patterns.clone(),
+        // No debounce: these tests assert on what reaches OneDrive, and the
+        // debounce is covered by its own tests in `pending`.
+        Duration::ZERO,
     )
     .await
     .expect("build filesystem");
@@ -789,5 +816,106 @@ async fn an_atomic_save_leaves_the_file_under_its_real_name() {
     assert!(
         !temp_there,
         "the temp name came back — this is what made an edit look like data loss"
+    );
+}
+
+/// The debounce's actual payoff: a file written and deleted inside the quiet
+/// period never reaches OneDrive at all.
+///
+/// Before, every close started an upload immediately, so a scratch file raced
+/// its own delete — and the fixes for that race are recovery, not prevention:
+/// the file is created remotely and then removed again. Waiting for quiet means
+/// there is nothing to recover from, and no request is spent either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_deleted_inside_the_quiet_period_never_uploads() {
+    if !fuse_available() {
+        skip("no /dev/fuse or fusermount3 available");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mountpoint = tmp.path().join("mount");
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    std::fs::create_dir_all(&cache_dir).unwrap();
+
+    let server = mock_graph().await;
+    let graph = test_graph(&server.uri(), tmp.path());
+    let db = Arc::new(Database::open(&tmp.path().join("items.db")).unwrap());
+    let config = Arc::new(test_config(&mountpoint));
+
+    let token = TokenSet {
+        access_token: "test-token".into(),
+        refresh_token: Some("refresh".into()),
+        expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+        token_type: "Bearer".into(),
+        scope: "Files.ReadWrite.All".into(),
+    };
+    let auth = Arc::new(AuthManager::for_tests(token, tmp.path().join("t2.json")));
+    let (engine, _events) = SyncEngine::new(
+        Arc::clone(&config),
+        Arc::clone(&db),
+        Arc::clone(&graph),
+        auth,
+        Some(cache_dir.clone()),
+    );
+    engine.sync_once().await.expect("delta pass");
+
+    let fs = vfs::OneDriveFS::new(
+        Arc::clone(&db),
+        Arc::clone(&graph),
+        mountpoint.clone(),
+        cache_dir.clone(),
+        config.excluded_patterns.clone(),
+        // Long enough that the delete lands well inside it, short enough that a
+        // failing test does not hang.
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("build filesystem");
+    let pending = fs.pending_uploads();
+
+    let mount_handle = match fuse3::raw::Session::new(fuse3::MountOptions::default())
+        .mount_with_unprivileged(fs, &mountpoint)
+        .await
+    {
+        Ok(handle) => handle,
+        Err(e) => {
+            skip(&format!("could not mount FUSE: {e}"));
+            return;
+        }
+    };
+
+    let mp = mountpoint.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let file = mp.join("scratch.bin");
+        let mut fh = std::fs::File::create(&file).expect("create");
+        fh.write_all(NEW_CONTENT).expect("write");
+        drop(fh);
+        std::fs::remove_file(&file).expect("delete inside the quiet period");
+    })
+    .await;
+
+    let outcome = if result.is_ok() {
+        // No upload should ever be attempted, so there is nothing to wait for
+        // except the absence of one.
+        let uploaded = await_request(&server, "PUT", Duration::from_secs(3)).await;
+        Some((uploaded, pending.count().await))
+    } else {
+        None
+    };
+    let _ = mount_handle.unmount().await;
+    result.expect("filesystem operations through the mount");
+
+    let (uploaded, still_queued) = outcome.unwrap();
+    assert!(
+        !uploaded,
+        "a file created and deleted inside the quiet period was uploaded anyway — \
+         the wait is not preventing the race, only papering over it"
+    );
+    assert_eq!(
+        still_queued, 0,
+        "the deleted file is still queued, so it will upload later and come back"
     );
 }

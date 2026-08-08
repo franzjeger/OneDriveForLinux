@@ -13,6 +13,10 @@ use sync_engine::{Config, Database, SyncEngine};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+/// How long shutdown waits for queued edits to reach OneDrive. Long enough for
+/// a slow link to finish a reasonable file, short enough not to hang a reboot.
+const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The release this binary was built from — see the same constant in odctl.
 const VERSION: &str = match option_env!("ONEDRIVE_RELEASE_VERSION") {
     Some(v) => v,
@@ -129,6 +133,9 @@ async fn main() -> Result<()> {
         .context("start sync engine")?;
 
     // ── FUSE VFS ───────────────────────────────────────────────────────────────
+    // Taken before the session consumes the filesystem, so shutdown can flush
+    // whatever is still waiting out its debounce.
+    let mut pending_uploads = None;
     let mount_handle = if config.on_demand {
         let mountpoint = config.sync_dir.clone();
         vfs::prepare_mountpoint(&mountpoint).context("prepare mountpoint")?;
@@ -139,9 +146,17 @@ async fn main() -> Result<()> {
             mountpoint.clone(),
             cache_dir(),
             config.excluded_patterns.clone(),
+            std::time::Duration::from_secs(config.upload_debounce_secs),
         )
         .await
         .context("create FUSE filesystem")?;
+        pending_uploads = Some(fs.pending_uploads());
+        if config.upload_debounce_secs > 0 {
+            info!(
+                "Edits upload after {}s of quiet — flushed on shutdown",
+                config.upload_debounce_secs
+            );
+        }
 
         let mount_options = MountOptions::default();
         let handle = Session::new(mount_options)
@@ -216,6 +231,7 @@ async fn main() -> Result<()> {
         Arc::clone(&recent),
         Arc::clone(&needs_auth),
         Arc::clone(&progress),
+        pending_uploads.clone(),
     )
     .await
     {
@@ -247,6 +263,29 @@ async fn main() -> Result<()> {
     }
 
     // ── Graceful shutdown ──────────────────────────────────────────────────────
+    // Before anything else: an edit still waiting out its debounce exists only
+    // on this machine. Shutting down without sending it would make the wait a
+    // way to lose work rather than a way to avoid races.
+    if let Some(pending) = &pending_uploads {
+        let waiting = pending.count().await;
+        if waiting > 0 {
+            info!("Sending {waiting} edit(s) still waiting to upload…");
+            pending.flush_now().await;
+            if pending.wait_idle(FLUSH_TIMEOUT).await {
+                info!("All edits uploaded");
+            } else {
+                // Not lost: they are in the cache and the queue, and the next
+                // start picks them up. Worth saying out loud all the same.
+                error!(
+                    "Gave up waiting after {}s with {} edit(s) unsent — they are \
+                     still cached and will upload on next start",
+                    FLUSH_TIMEOUT.as_secs(),
+                    pending.count().await
+                );
+            }
+        }
+    }
+
     if let Some(handle) = mount_handle {
         info!("Unmounting FUSE...");
         if let Err(e) = handle.unmount().await {
