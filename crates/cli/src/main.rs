@@ -25,11 +25,23 @@ trait OneDriveControl {
 
 // ── CLI definition ─────────────────────────────────────────────────────────────
 
+/// The release this binary was built from.
+///
+/// Every crate in the workspace is version 0.1.0 and always has been — the
+/// release number lives only in the git tag, so `--version` reported "0.1.0"
+/// for every build ever shipped. That is useless for the one question it gets
+/// asked: did my upgrade actually take? The release workflow sets
+/// ONEDRIVE_RELEASE_VERSION; a build without it is not a release.
+pub const VERSION: &str = match option_env!("ONEDRIVE_RELEASE_VERSION") {
+    Some(v) => v,
+    None => concat!(env!("CARGO_PKG_VERSION"), " (development build)"),
+};
+
 #[derive(Debug, Parser)]
 #[command(
     name = "odctl",
     about = "Control the OneDrive for Linux daemon",
-    version
+    version = VERSION
 )]
 struct Cli {
     #[command(subcommand)]

@@ -167,7 +167,11 @@ Environment=RUST_LOG=info
 [Install]
 WantedBy=default.target
 EOF
-systemctl --user daemon-reload
+# A machine with no session bus (a container, a build box) has no systemd user
+# instance to reload. Under `set -e` the failure aborted the install part-way,
+# leaving the launcher entry and icons unwritten — so --no-service, whose whole
+# point is installing without systemd, could not finish.
+systemctl --user daemon-reload 2>/dev/null || true
 ok "Service installed"
 
 # ── Dolphin right-click menu (plain file, no compilation) ────────────────────

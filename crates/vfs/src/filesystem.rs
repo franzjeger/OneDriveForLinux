@@ -959,12 +959,51 @@ impl Filesystem for OneDriveFS {
                                     // concurrent rename() may have changed them while we
                                     // were uploading. Without this, we'd overwrite the
                                     // renamed entry with the stale pre-rename name.
-                                    let current = db
-                                        .get_item_by_id(&item.id)
-                                        .await
-                                        .ok()
-                                        .flatten()
-                                        .unwrap_or(item);
+                                    let current = match db.get_item_by_id(&item.id).await {
+                                        Ok(Some(current)) => current,
+                                        // No row: the file was deleted through the
+                                        // mount while this upload was in flight.
+                                        //
+                                        // The delete is the newer intent and has to
+                                        // win. Falling back to our own stale copy
+                                        // and upserting it — which is what this used
+                                        // to do — put the file back, and the upload
+                                        // had just created it on OneDrive too, so it
+                                        // came back with its content. Deleting a file
+                                        // within a few seconds of writing it simply
+                                        // did not take.
+                                        //
+                                        // unlink() could not have prevented this: for
+                                        // a `_local_*` item there was nothing on
+                                        // OneDrive to delete at the time it ran. The
+                                        // remote copy only exists once we get here,
+                                        // so removing it is our job.
+                                        Ok(None) => {
+                                            info!(
+                                                "{} was deleted while its upload was in \
+                                                 flight — removing the copy the upload \
+                                                 just created",
+                                                item.name
+                                            );
+                                            if let Err(e) = graph.delete_item(&updated.id).await {
+                                                error!(
+                                                    "could not remove {} from OneDrive after \
+                                                     it was deleted locally: {e} — it will \
+                                                     come back on the next delta",
+                                                    item.name
+                                                );
+                                            }
+                                            let _ = std::fs::remove_file(&cache_path);
+                                            return;
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                "could not re-read {} after upload: {e}",
+                                                item.name
+                                            );
+                                            return;
+                                        }
+                                    };
                                     let mut updated_item = current;
                                     updated_item.size = new_size;
                                     updated_item.etag = updated.e_tag;
