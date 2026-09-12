@@ -54,7 +54,7 @@ impl SyncEngine {
             .ok()
             .flatten();
         let existing_id = existing_item.as_ref().map(|i| i.id.clone());
-        let e_tag = existing_item.as_ref().and_then(|i| i.e_tag.clone());
+        let e_tag = existing_item.as_ref().and_then(|i| i.etag.clone());
 
         let _guard = if let Some(ref id) = existing_id {
             let lock = self.item_lock(id);
