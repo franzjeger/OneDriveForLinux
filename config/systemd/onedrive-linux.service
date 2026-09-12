@@ -1,14 +1,14 @@
 [Unit]
 Description=OneDrive for Linux
-After=network-online.target
+After=network-online.target graphical-session.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/onedrive-daemon
 Restart=on-failure
-RestartSec=5
+RestartSec=10
 Environment=RUST_LOG=info
 
 [Install]
-WantedBy=default.target
+WantedBy=default.target graphical-session.target
