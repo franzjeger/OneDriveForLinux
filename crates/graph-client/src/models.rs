@@ -173,12 +173,14 @@ pub struct UploadSession {
 
 /// Payload for creating an upload session.
 #[derive(Debug, Serialize)]
+#[derive(Clone)]
 pub struct CreateUploadSessionRequest {
     pub item: UploadSessionItem,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Clone)]
 pub struct UploadSessionItem {
     #[serde(rename = "@microsoft.graph.conflictBehavior")]
     pub conflict_behavior: String,

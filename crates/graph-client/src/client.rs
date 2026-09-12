@@ -479,7 +479,7 @@ impl GraphClient {
         if size <= LARGE_FILE_THRESHOLD {
             self.upload_small(parent_id, name, path, if_match).await
         } else {
-            let session = self.get_upload_session(parent_id, name, size).await?;
+            let session = self.get_upload_session(parent_id, name, size, if_match).await?;
             self.upload_via_session(&session, path, size).await
         }
     }
@@ -536,6 +536,7 @@ impl GraphClient {
         parent_id: &str,
         name: &str,
         _size: u64,
+        if_match: Option<&str>,
     ) -> GraphResult<UploadSession> {
         let url = format!(
             "{}/me/drive/items/{parent_id}:/{}:/createUploadSession",
@@ -549,17 +550,26 @@ impl GraphClient {
             },
         };
 
+        let if_match_owned = if_match.map(|s| s.to_string());
+
         let resp = self
-            .request_with_retry(|| async {
-                let token = self.bearer().await?;
-                let resp = self
-                    .http
-                    .post(&url)
-                    .bearer_auth(&token)
-                    .json(&body)
-                    .send()
-                    .await?;
-                Ok(resp)
+            .request_with_retry(|| {
+                let url = url.clone();
+                let body = body.clone();
+                let if_match_owned = if_match_owned.clone();
+                async move {
+                    let token = self.bearer().await?;
+                    let mut req = self
+                        .http
+                        .post(&url)
+                        .bearer_auth(&token)
+                        .json(&body);
+                    if let Some(etag) = if_match_owned {
+                        req = req.header("If-Match", etag);
+                    }
+                    let resp = req.send().await?;
+                    Ok(resp)
+                }
             })
             .await?;
         let session: UploadSession = resp.json().await?;

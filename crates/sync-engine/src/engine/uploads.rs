@@ -192,7 +192,7 @@ impl SyncEngine {
 
         let session = self
             .graph
-            .get_upload_session(&entry.parent_id, &entry.name, size)
+            .get_upload_session(&entry.parent_id, &entry.name, size, None)
             .await?;
         // Stored before the first byte goes out, so an interruption at any
         // point still leaves something to resume from.
