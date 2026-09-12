@@ -85,7 +85,8 @@ Full gjennomgang av hele kodebasen over 9 PR-er (+6 dependency-PR-er), alle merg
 - Engine splittet i moduler (`engine/{mod,delta,local,pin}.rs`).
 
 ### Gjenstående (fra forrige logg + nytt)
-- Feltvalidering av QuickXorHash mot ekte OneDrive → oppgrader til hard-fail.
-- Upload-side konfliktdeteksjon (etag-sjekk før opplasting) — fortsatt åpen.
-- `sync_folders`-filter for `handle_local_event` — fortsatt åpen.
-- Dogfooding mot ekte OneDrive før v0.1.0-tag.
+- [x] Feltvalidering av QuickXorHash mot ekte OneDrive → oppgrader til hard-fail.
+- [x] Upload-side konfliktdeteksjon (etag-sjekk før opplasting).
+- [x] `sync_folders`-filter for `handle_local_event`.
+- [x] Systemd auto-start robusthet (via graphical-session.target).
+- [ ] Dogfooding mot ekte OneDrive før v0.1.0-tag.
