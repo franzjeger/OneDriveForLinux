@@ -17,7 +17,7 @@ anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 signal-hook = "0.3"
-signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
+signal-hook-tokio = { version = "0.4", features = ["futures-v0_3"] }
 dirs.workspace = true
 zbus = { version = "5", features = ["tokio"] }
 fuse3 = { version = "0.7", features = ["tokio-runtime", "unprivileged"] }
