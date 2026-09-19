@@ -172,8 +172,7 @@ pub struct UploadSession {
 }
 
 /// Payload for creating an upload session.
-#[derive(Debug, Serialize)]
-#[derive(Clone)]
+#[derive(Debug, Serialize, Clone)]
 pub struct CreateUploadSessionRequest {
     pub item: UploadSessionItem,
 }

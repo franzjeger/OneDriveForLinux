@@ -479,7 +479,9 @@ impl GraphClient {
         if size <= LARGE_FILE_THRESHOLD {
             self.upload_small(parent_id, name, path, if_match).await
         } else {
-            let session = self.get_upload_session(parent_id, name, size, if_match).await?;
+            let session = self
+                .get_upload_session(parent_id, name, size, if_match)
+                .await?;
             self.upload_via_session(&session, path, size).await
         }
     }
@@ -559,11 +561,7 @@ impl GraphClient {
                 let if_match_owned = if_match_owned.clone();
                 async move {
                     let token = self.bearer().await?;
-                    let mut req = self
-                        .http
-                        .post(&url)
-                        .bearer_auth(&token)
-                        .json(&body);
+                    let mut req = self.http.post(&url).bearer_auth(&token).json(&body);
                     if let Some(etag) = if_match_owned {
                         req = req.header("If-Match", etag);
                     }

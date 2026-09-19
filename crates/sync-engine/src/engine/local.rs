@@ -47,12 +47,7 @@ impl SyncEngine {
     /// Holds a per-item lock (if item exists in DB) to prevent concurrent operations.
     pub async fn upload_item(&self, path: &Path) -> anyhow::Result<()> {
         // Acquire per-item lock if this file is already tracked.
-        let existing_item = self
-            .db
-            .get_item_by_path(path)
-            .await
-            .ok()
-            .flatten();
+        let existing_item = self.db.get_item_by_path(path).await.ok().flatten();
         let existing_id = existing_item.as_ref().map(|i| i.id.clone());
         let e_tag = existing_item.as_ref().and_then(|i| i.etag.clone());
 
@@ -88,7 +83,10 @@ impl SyncEngine {
             warn!("Failed to send ItemStateChanged event: {e}");
         }
 
-        let result_item = self.graph.upload_file_if_match(&parent_id, name, path, e_tag.as_deref()).await?;
+        let result_item = self
+            .graph
+            .upload_file_if_match(&parent_id, name, path, e_tag.as_deref())
+            .await?;
         let db_item = self.drive_item_to_db(&result_item, path, false);
         self.db.upsert_item(&db_item).await?;
 
