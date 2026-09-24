@@ -20,7 +20,7 @@ signal-hook = "0.3"
 signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
 dirs.workspace = true
 zbus = { version = "5", features = ["tokio"] }
-fuse3 = { version = "0.7", features = ["tokio-runtime", "unprivileged"] }
+fuse3 = { version = "0.9", features = ["tokio-runtime", "unprivileged"] }
 futures.workspace = true
 parking_lot.workspace = true
 chrono.workspace = true
