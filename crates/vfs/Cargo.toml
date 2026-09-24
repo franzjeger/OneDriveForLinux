@@ -4,7 +4,7 @@ version = "0.15.0"
 edition = "2021"
 
 [dependencies]
-fuse3 = { version = "0.7", features = ["tokio-runtime", "unprivileged"] }
+fuse3 = { version = "0.9", features = ["tokio-runtime", "unprivileged"] }
 sync-engine = { path = "../sync-engine" }
 graph-client = { path = "../graph-client" }
 tokio.workspace = true
